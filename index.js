@@ -251,7 +251,16 @@ function unmark(id) {
 
 function toast(kind, text) {
     const t = globalThis.toastr;
-    if (t?.[kind]) t[kind](text, 'Primal Catharsis', { timeOut: 6000, closeButton: true, progressBar: true, escapeHtml: true });
+    if (!t?.[kind]) return;
+    t[kind](text, 'Primal Catharsis', { timeOut: 6000, closeButton: true, progressBar: true, escapeHtml: true });
+    // a modal <dialog> sits in the browser's top layer, above everything — toasts included — so pull them inside
+    const dlg = document.getElementById('pc-popup');
+    const box = document.getElementById('toast-container');
+    if (dlg?.open && box && box.parentNode !== dlg) dlg.appendChild(box);
+}
+function releaseToasts(dlg) {
+    const box = document.getElementById('toast-container');
+    if (box && box.parentNode === dlg) document.body.appendChild(box);
 }
 
 // ─── The report: what was cut ───
@@ -688,9 +697,8 @@ function hintText() {
 function popupHtml() {
     const { html: opts, disabled } = profileOptions();
     return `
-        <div class="pc-sheet" role="dialog" aria-modal="true" aria-labelledby="pc-title">
+        <div class="pc-card">
             <div class="pc-tape" aria-hidden="true"></div>
-            <div class="pc-grip" aria-hidden="true"></div>
             <button type="button" class="pc-x" data-pc="close" aria-label="Закрыть" title="Закрыть (Esc)"><i class="fa-solid fa-xmark"></i></button>
             <div class="pc-stamp" aria-hidden="true"><i class="fa-solid fa-stamp"></i>ПРОВЕРЕНО<br>НЕ ВОЛК</div>
             <div class="pc-kicker pc-in" style="--i:0"><i class="fa-solid fa-triangle-exclamation"></i> Департамент по борьбе с рычанием, форма 13‑Б</div>
@@ -759,22 +767,38 @@ async function testRoast(btn) {
 }
 
 function openPopup() {
-    document.getElementById('pc-popup')?.remove();
+    try {
+        showPopup();
+    } catch (e) {
+        console.error('[Primal Catharsis] the panel failed to open:', e);
+        toast('error', `Панель не открылась: ${e?.message || e}`);
+    }
+}
+
+// A native modal <dialog>: it opens in the browser's top layer, so no z-index, transform or
+// stacking context of the tavern (or of a theme) can hide it or shove it off the screen.
+function showPopup() {
+    const old = document.getElementById('pc-popup');
+    if (old) { try { old.close?.(); } catch { /* already closed */ } old.remove(); }
     const s = settings();
-    const wrap = document.createElement('div');
-    wrap.id = 'pc-popup';
-    wrap.innerHTML = popupHtml();
+    const dlg = document.createElement('dialog');
+    dlg.id = 'pc-popup';
+    dlg.setAttribute('aria-labelledby', 'pc-title');
+    dlg.innerHTML = popupHtml();
     let closing = false;
     const close = () => {
         if (closing) return;
         closing = true;
-        document.removeEventListener('keydown', onKey);
-        wrap.classList.add('pc-bye');
-        setTimeout(() => wrap.remove(), calm() ? 0 : 260);
+        dlg.classList.add('pc-bye');
+        setTimeout(() => {
+            releaseToasts(dlg);
+            try { dlg.close(); } catch { /* fine */ }
+            dlg.remove();
+        }, calm() ? 0 : 220);
     };
-    const onKey = (e) => { if (e.key === 'Escape') close(); };
-    wrap.addEventListener('click', (e) => {
-        if (e.target === wrap) return close();
+    dlg.addEventListener('cancel', (e) => { e.preventDefault(); close(); });   // Esc, or the back gesture on Android
+    dlg.addEventListener('click', (e) => {
+        if (e.target === dlg) return close();                                  // a tap on the dimmed area
         const btn = e.target.closest('[data-pc]');
         const act = btn?.dataset.pc;
         if (act === 'close') close();
@@ -782,26 +806,42 @@ function openPopup() {
             const want = act === 'on';
             if (want === isOn()) return;
             setOn(want);
-            paintPopup(wrap, true);
+            paintPopup(dlg, true);
             toast(want ? 'success' : 'info', want
                 ? 'Зверь в наморднике. Рычание теперь административное правонарушение.'
                 : 'Зверь на свободе. Пусть ваши возлюбленные хотя бы перестанут обнюхивать людей.');
         } else if (act === 'log') {
             s.showLog = s.showLog === false;
             saveSettings();
-            paintPopup(wrap);
+            paintPopup(dlg);
             renderAll();
         } else if (act === 'test') testRoast(btn);
     });
-    wrap.querySelector('#pc-profile')?.addEventListener('change', (e) => {
+    dlg.querySelector('#pc-profile')?.addEventListener('change', (e) => {
         s.commentProfile = e.target.value;
         saveSettings();
-        paintPopup(wrap);
+        paintPopup(dlg);
     });
-    document.addEventListener('keydown', onKey);
-    document.body.appendChild(wrap);
-    paintPopup(wrap);
-    wrap.querySelector('.pc-seg-btn[aria-checked="true"]')?.focus({ preventScroll: true });
+    document.body.appendChild(dlg);
+    paintPopup(dlg);
+    if (typeof dlg.showModal === 'function') dlg.showModal();
+    else dlg.setAttribute('open', '');                                         // very old browsers
+    dlg.querySelector('.pc-seg-btn[aria-checked="true"]')?.focus({ preventScroll: true });
+}
+
+// a second way in, in case the wand menu misbehaves on some theme or phone: type /primal
+function addCommand() {
+    const c = ctx();
+    const run = () => { openPopup(); return ''; };
+    try {
+        if (c.SlashCommandParser?.addCommandObject && c.SlashCommand?.fromProps) {
+            c.SlashCommandParser.addCommandObject(c.SlashCommand.fromProps({ name: 'primal', callback: run, helpString: 'Открыть панель Primal Catharsis.' }));
+        } else {
+            c.registerSlashCommand?.('primal', run, [], '– открыть панель Primal Catharsis', true, true);
+        }
+    } catch (e) {
+        console.warn('[Primal Catharsis] /primal was not registered:', e);
+    }
 }
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
@@ -824,6 +864,7 @@ function init() {
     }
     document.addEventListener('click', onLogClick);
     inject();
+    addCommand();
     watchChat();
     renderAll();
     // the wand menu appears a little later than us
