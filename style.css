@@ -164,7 +164,7 @@
 .pc-between { justify-content: space-between; }
 .pc-label { display: block; margin-bottom: 6px; font-weight: 600; }
 .pc-section i.fa-solid:not(.fa-spinner) { color: var(--pc-acc); }
-.pc-label i, #pc-log-label i { width: 1.2em; margin-right: 3px; text-align: center; }
+.pc-label i, #pc-log-label i, #pc-stream-label i { width: 1.2em; margin-right: 3px; text-align: center; }
 .pc-select { flex: 1; min-width: 0; margin: 0 !important; }
 .pc-hint { display: block; margin-top: 6px; font-size: 0.78em; line-height: 1.35; color: var(--pc-em); }
 
@@ -198,7 +198,8 @@
 
 .pc-fine { margin: 14px 0 0; font-size: 0.72em; font-style: italic; color: var(--pc-em); }
 
-.pc-x:focus-visible, .pc-seg-btn:focus-visible, .pc-switch:focus-visible, .pc-mini:focus-visible, .pc-log-head:focus-visible {
+.pc-x:focus-visible, .pc-seg-btn:focus-visible, .pc-switch:focus-visible, .pc-mini:focus-visible, .pc-log-head:focus-visible,
+.pc-undo:focus-visible, .pc-soap-skip:focus-visible {
     outline: 2px solid var(--interactable-outline-color, var(--pc-acc)); outline-offset: 2px;
 }
 
@@ -216,6 +217,16 @@
     animation: pc-soap-in calc(var(--pc-t) * 4) var(--pc-spring) both;
 }
 .pc-soap > i { color: var(--pc-acc); animation: pc-scrub calc(var(--pc-t) * 5) ease-in-out infinite; }
+/* «не ждать — оставить как есть» */
+.pc-soap-skip {
+    all: unset; box-sizing: border-box; pointer-events: auto; cursor: pointer;
+    display: grid; place-items: center; width: 20px; height: 20px; margin-left: 2px; border-radius: 50%;
+    font-size: 0.85em; color: var(--pc-em);
+    background: color-mix(in srgb, var(--pc-fg) 10%, transparent);
+    transition: transform calc(var(--pc-t) * 3) var(--pc-spring), color var(--pc-t), background-color var(--pc-t);
+}
+.pc-soap-skip:hover { transform: rotate(90deg) scale(1.12); color: var(--pc-fg); background: color-mix(in srgb, var(--pc-bad) 30%, transparent); }
+.pc-soap-skip:active { transform: rotate(90deg) scale(0.88); }
 .pc-bubble {
     position: absolute; bottom: 70%; width: 8px; height: 8px; border-radius: 50%; opacity: 0;
     border: 1px solid color-mix(in srgb, var(--pc-acc) 70%, var(--pc-fg));
@@ -255,6 +266,11 @@
 .pc-log-title { flex: none; font-weight: 700; color: var(--pc-c); }
 .pc-log-words { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--pc-em); }
 .pc-log-meta { flex: none; font-size: 0.9em; white-space: nowrap; color: var(--pc-em); opacity: 0.8; }
+.pc-log-orig {
+    display: none; flex: none; padding: 0 6px; border-radius: 999px; font-size: 0.85em;
+    color: var(--pc-bad); border: 1px solid color-mix(in srgb, var(--pc-bad) 50%, transparent);
+}
+.pc-log.pc-orig .pc-log-orig { display: inline-block; animation: pc-bump calc(var(--pc-t) * 4) var(--pc-spring); }
 .pc-log-chev { flex: none; font-size: 0.85em; opacity: 0.7; transition: transform calc(var(--pc-t) * 2) ease; }
 .pc-open .pc-log-chev { transform: rotate(180deg); }
 
@@ -290,6 +306,17 @@
     color: var(--pc-bad); border: 1px solid color-mix(in srgb, var(--pc-bad) 50%, transparent);
 }
 
+.pc-log-tools { display: flex; justify-content: flex-end; padding: 0 10px 8px; }
+.pc-undo {
+    all: unset; box-sizing: border-box; cursor: pointer; font: inherit; font-size: 0.92em;
+    display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+    color: var(--pc-em); border: 1px solid color-mix(in srgb, var(--pc-c) 40%, transparent);
+    transition: color var(--pc-t), border-color var(--pc-t), transform var(--pc-t);
+}
+.pc-undo:hover { color: var(--pc-fg); border-color: var(--pc-c); }
+.pc-undo:hover > i { animation: pc-rewind calc(var(--pc-t) * 4) ease-in-out; }
+.pc-undo:active { transform: scale(0.95); }
+
 .pc-log-comment {
     display: flex; align-items: flex-start; gap: 8px; padding: 6px 10px 7px;
     border-top: 1px dashed color-mix(in srgb, var(--pc-c) 30%, transparent);
@@ -321,6 +348,7 @@
 @keyframes pc-stamp { from { opacity: 0; transform: scale(2.4) rotate(-10deg); } 60% { opacity: 0.85; } to { opacity: 0.6; transform: rotate(12deg); } }
 @keyframes pc-flip { from { opacity: 0.2; transform: perspective(400px) rotateX(75deg); } }
 @keyframes pc-bump { 40% { transform: scale(1.25); } }
+@keyframes pc-rewind { to { transform: rotate(-360deg); } }
 @keyframes pc-poke { 50% { transform: translateX(4px); } }
 @keyframes pc-soap-in { from { opacity: 0; transform: translate(-50%, -50%) scale(0.5) rotate(-8deg); } }
 @keyframes pc-scrub { 0%, 100% { transform: rotate(-12deg) translateX(-2px); } 50% { transform: rotate(12deg) translateX(2px); } }
