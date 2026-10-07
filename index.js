@@ -18,7 +18,7 @@ const NUDGE_KEY = 'primal_catharsis_nudge';
 const SHAME_KEY = 'primal_catharsis_shame';   // used by 1.0–1.1; only ever cleared now
 const MAX_EDITS = 2;
 const EDIT_TIMEOUT = 120000;
-const DEFAULTS = { enabled: true, showLog: true, hideStream: true, fixProfile: '', commentProfile: '', customTags: '', kenMemory: [] };
+const DEFAULTS = { enabled: true, showLog: true, hideStream: true, fixMode: 'auto', fixProfile: '', commentProfile: '', customTags: '', kenMemory: [] };
 const KEN = 'Toxic Ken';
 const KEN_MEMORY = 5;        // Ken's last lines he sees, so he doesn't repeat himself (≈100 tokens)
 const KEN_SNIP = 90;         // …each one clipped to this many characters
@@ -265,11 +265,17 @@ ${ch} and the narration never use primal or beast-coded clichés, in any languag
     c.setExtensionPrompt(NUDGE_KEY, `[Primal Catharsis: no primal, beastly or possessive wording — ${ch} speaks like a person.]`, POS.IN_CHAT, 0, false, ROLE_SYSTEM);
 }
 
-// ─── Catching: before anyone sees the reply ───
-let job = null;              // { id, ctrl } — the reply being fixed right now
+// ─── Catching ───
+// Two ways to fix a reply:
+//  • «до показа» (strict): the tavern waits for us — neither the chat nor other extensions ever see the beast;
+//  • «в фоне» (background): the tavern and every other extension carry on at once, the reply sits under soap,
+//    gets fixed on the side, and then only the changed wording is patched into whatever the reply has become
+//    by then (external blocks appended, images generated, tracker tags rewritten — all of that survives).
+// «Авто» picks the background when it sees extensions that build on a fresh reply (external blocks, inline images):
+// holding the reply back breaks them — they lose their images or hang their blocks on the user's message.
+const jobs = new Map();      // message id → { ctrl, held }
 const skipped = new Set();   // replies the player told us to leave alone
-let shamedId = null;         // the reply currently under soap
-let shamedLabel = '';
+const shamed = new Map();    // message id → the soap label on it
 let genType = null;          // what the tavern is generating now (normal, swipe, continue, impersonate, quiet…)
 let armed = false;           // a real generation started and its reply hasn't arrived yet
 // «message received» also comes for greetings, /sendas and other command or extension inserts — never ours to edit
@@ -281,10 +287,9 @@ function mesEl(id) { return document.querySelector(`#chat .mes[mesid="${id}"]`);
 
 // the caught reply waits under soap; the little × means «don't wait, leave it as it is»
 function mark(id, label = 'моем рот с мылом…') {
-    shamedId = id;
-    shamedLabel = label;
+    shamed.set(id, label);
     const el = mesEl(id);
-    if (!el) return;
+    if (!el) return;                                   // not drawn yet — the chat watcher puts the soap on when it is
     el.classList.add('pc-shamed');
     const block = el.querySelector('.mes_block');
     if (!block) return;
@@ -301,15 +306,17 @@ function mark(id, label = 'моем рот с мылом…') {
     if (text.textContent !== label) text.textContent = label;
 }
 function unmark(id) {
-    if (shamedId === id) shamedId = null;
+    shamed.delete(id);
     const el = mesEl(id);
     el?.classList.remove('pc-shamed');
     el?.querySelector('.pc-soap')?.remove();
 }
-function release() { if (!job && shamedId !== null) unmark(shamedId); }
+// soap left over from a stream that never turned into a job
+function release() { for (const id of [...shamed.keys()]) if (!jobs.has(id)) unmark(id); }
 
 function skip(id) {
-    if (job?.id === id) job.ctrl.abort();
+    const j = jobs.get(id);
+    if (j) j.ctrl.abort();
     else skipped.add(id);
     unmark(id);
 }
@@ -337,7 +344,7 @@ function onStreamToken(text) {
     const c = ctx();
     const id = (c?.chat?.length ?? 0) - 1;
     const msg = c?.chat?.[id];
-    if (!armed || id <= 0 || !msg || msg.is_user || msg.is_system || shamedId === id || skipped.has(id)) return;
+    if (!armed || id <= 0 || !msg || msg.is_user || msg.is_system || shamed.has(id) || skipped.has(id)) return;
     const t = typeof text === 'string' && text ? text : msg.mes;
     if (findPrimalDetailed(t).length) mark(id, 'ловим зверя на лету…');
 }
@@ -350,63 +357,188 @@ function addCuts(bag, hits) {
     }
 }
 
-// The tavern awaits this before it shows the reply and before other extensions get «message received».
+// Extensions that build on top of a fresh reply (External Blocks and the like, inline image generation).
+// Holding the reply back breaks them, so «Авто» switches to the background when it sees one.
+let sensitiveCache = { at: 0, value: false, why: '' };
+function pipelineSensitive() {
+    if (Date.now() - sensitiveCache.at < 20000) return sensitiveCache;
+    let why = '';
+    const seen = new WeakSet();
+    const isBlock = (o) => 'template' in o && ('block_type' in o || 'char_message' in o || 'generation_order' in o || 'api_preset' in o);
+    const walk = (o, depth) => {
+        if (!o || typeof o !== 'object' || seen.has(o) || depth > 5) return false;
+        seen.add(o);
+        if (!Array.isArray(o) && isBlock(o)) return o.disabled !== true;
+        for (const v of Array.isArray(o) ? o : Object.values(o)) if (walk(v, depth + 1)) return true;
+        return false;
+    };
+    const c = ctx();
+    const es = c?.extensionSettings || {};
+    // ExtBlocks (and its forks): enabled, with blocks that run after a bot reply — in the preset or in the card
+    const eb = es.ExtBlocks;
+    if (eb?.extblocks_is_enabled) {
+        const set = eb.sets?.[eb.active_set_idx];
+        const scoped = c?.characters?.[c?.characterId]?.data?.extensions?.ExtBlocks;
+        const blocks = [...(Array.isArray(set?.global_blocks) ? set.global_blocks : []), ...(Array.isArray(scoped) ? scoped : [])];
+        if (blocks.some(b => b && !b.disabled && (b.char_message || b.generation_pause))) why = 'включён ExtBlocks';
+    }
+    if (!why && walk(es, 0)) why = 'подключены внешние блоки';
+    if (!why) {
+        const chat = ctx()?.chat || [];
+        for (let i = chat.length - 1; i >= Math.max(0, chat.length - 8); i--) {
+            if (/data-iig-instruction|\[IMG:GEN\]/i.test(chat[i]?.mes || '')) { why = 'в чате генерируются картинки'; break; }
+        }
+        if (!why && document.querySelector('#chat [data-iig-instruction]')) why = 'в чате генерируются картинки';
+    }
+    sensitiveCache = { at: Date.now(), value: !!why, why };
+    return sensitiveCache;
+}
+function fixMode() {
+    const m = settings().fixMode;
+    if (m === 'strict' || m === 'background') return m;
+    return pipelineSensitive().value ? 'background' : 'strict';
+}
+
+// The tavern awaits this. In the strict mode we keep it waiting until the reply is clean;
+// in the background mode we return at once and fix the reply on the side.
 async function onReceived(id, type) {
     const c = ctx();
     const msg = c?.chat?.[id];
-    if (job?.id === id) return;                       // a second call for the same reply — already on it
+    if (jobs.has(id)) return;                         // a second call for the same reply — already on it
     const fromModel = armed && !NOT_A_REPLY.has(type);
     armed = false;
-    if (!fromModel || !isOn() || !msg || msg.is_user || msg.is_system || id === 0) { if (shamedId === id) unmark(id); return; }
+    if (!fromModel || !isOn() || !msg || msg.is_user || msg.is_system || id === 0) { if (shamed.has(id)) unmark(id); return; }
     if (type !== 'continue') dropData(msg);           // a fresh reply inherits nothing from the previous swipe's report
-    let hits = findPrimalDetailed(msg.mes);
+    const hits = findPrimalDetailed(msg.mes);
     if (!hits.length) { skipped.delete(id); unmark(id); renderSoon(id); return; }
     if (skipped.delete(id)) {                         // the player waved it through
         unmark(id);
         finalize(id, { cuts: [], left: hits, attempts: 0, orig: null });
         return;
     }
+    const held = fixMode() === 'strict';
+    const run = fixReply(id, msg, hits, held).catch(e => console.warn('[Primal Catharsis] the fix failed:', e));
+    if (held) await run;
+}
 
+async function fixReply(id, msg, hits, held) {
     const chatId = currentChat();
-    const original = msg.mes;
+    const swipe = msg.swipe_id ?? 0;
+    const sig = msgSig(msg);
+    // the reply as it is now — the same object, or its fresh copy after a reload of the same chat
+    const cur = () => {
+        const m = ctx()?.chat?.[id];
+        return m && (m === msg || msgSig(m) === sig) ? m : null;
+    };
+    const gone = () => currentChat() !== chatId || !cur() || (cur().swipe_id ?? 0) !== swipe;
+    const ctrl = new AbortController();
+    jobs.set(id, { ctrl, held });
+    const before = msg.mes;                            // what «вернуть как было» brings back
     const bag = [];
     addCuts(bag, hits);
-    const ctrl = new AbortController();
-    job = { id, ctrl };
-    let text = original;
+    let base = msg.mes;                                // the reply our edits are made against
+    let text = base;
     let attempts = 0;
-    const words = hits.map(h => h.word);
-    console.info('[Primal Catharsis] caught:', words);
-    toast('error', `Попался зверь: ${words.map(h => `«${h}»`).join(', ')}. ${who()} отправляется подумать над своим поведением — ответ поправим до показа. Нажми сюда, чтобы не ждать.`,
+    let applied = false;
+    console.info('[Primal Catharsis] caught:', hits.map(h => h.word));
+    // what exactly was caught goes into the report above the message, not into the toast
+    toast('error', `Попался зверь. ${who()} отправляется подумать над своим поведением — ответ ${held ? 'поправим до показа' : 'поправим, пока он под мылом'}. Нажми сюда, чтобы не ждать.`,
         { onclick: () => skip(id), timeOut: 9000 });
     try {
-        while (hits.length && attempts < MAX_EDITS && !ctrl.signal.aborted) {
-            attempts++;
-            mark(id, `моем рот с мылом… заход ${attempts} из ${MAX_EDITS}`);
-            let fixed = null;
-            try {
-                fixed = await editText(text, hits.map(h => h.word), ctrl.signal);
-            } catch (e) {
-                if (!ctrl.signal.aborted) console.warn('[Primal Catharsis] the edit failed:', e);
+        // round 2 only happens if someone rewrote the very sentences we fixed while we were at it
+        for (let round = 0; round < 2 && !ctrl.signal.aborted; round++) {
+            while (hits.length && attempts < MAX_EDITS + round && !ctrl.signal.aborted) {
+                attempts++;
+                mark(id, `моем рот с мылом… заход ${attempts} из ${MAX_EDITS}`);
+                let fixed = null;
+                try {
+                    fixed = await editText(text, hits.map(h => h.word), ctrl.signal);
+                } catch (e) {
+                    if (!ctrl.signal.aborted) console.warn('[Primal Catharsis] the edit failed:', e);
+                }
+                if (gone()) return;                    // chat switched, message deleted or swiped away — touch nothing
+                if (!fixed) continue;
+                text = fixed;
+                hits = findPrimalDetailed(text);
+                addCuts(bag, hits);
             }
-            if (currentChat() !== chatId || ctx()?.chat?.[id] !== msg) return;   // the chat moved on — touch nothing
-            if (!fixed) continue;
-            text = fixed;
+            if (ctrl.signal.aborted || text === base) break;
+            // never overwrite: patch only our wording into what the reply is NOW
+            const now = cur();
+            const merged = now.mes === base ? text : mergeEdit(base, text, now.mes);
+            if (merged !== null) {
+                applyText(id, now, merged, { announce: !held });
+                applied = true;
+                break;
+            }
+            base = now.mes;
+            text = base;
             hits = findPrimalDetailed(text);
-            addCuts(bag, hits);
         }
     } finally {
-        if (job?.ctrl === ctrl) job = null;
+        if (jobs.get(id)?.ctrl === ctrl) jobs.delete(id);
         unmark(id);
     }
-    const aborted = ctrl.signal.aborted;
-    const changed = text !== original;
-    if (changed) applyText(id, msg, text);
-    finalize(id, { cuts: bag, left: hits, attempts, orig: changed ? original : null });
-    if (aborted) toast('info', 'Оставили как есть. Сегодня зверь ночует дома.');
-    else if (!hits.length) toast('success', `Чисто. ${who()} снова изъясняется словами через рот.`);
-    else if (!changed) toast('warning', 'Редактор не справился, ответ остался как был. Подробности — в консоли (F12).');
-    else toast('warning', `Зверь победил после ${attempts} ${plural(attempts, ['правки', 'правок', 'правок'])}: ${hits.map(h => `«${h.word}»`).join(', ')}. Дальше — руками или молитвой.`);
+    if (gone()) return;
+    const left = findPrimalDetailed(cur().mes);
+    finalize(id, { cuts: bag, left, attempts, orig: applied ? before : null });
+    if (ctrl.signal.aborted) toast('info', 'Оставили как есть. Сегодня зверь ночует дома.');
+    else if (!left.length) toast('success', `Чисто. ${who()} снова изъясняется словами через рот.`);
+    else if (!applied) toast('warning', 'Редактор не справился, ответ остался как был. Подробности — в консоли (F12).');
+    else toast('warning', `Зверь победил после ${attempts} ${plural(attempts, ['правки', 'правок', 'правок'])}. Что прорвалось — в сводке над сообщением.`);
+}
+
+// ─── Patching into a reply that moved on ───
+// Prose pieces of `text`, cut by the technical chunks of its base version (in order).
+function piecesBy(text, keep) {
+    const out = [];
+    let pos = 0;
+    for (const k of keep) {
+        const i = text.indexOf(k, pos);
+        if (i === -1) return null;
+        out.push(text.slice(pos, i));
+        pos = i + k.length;
+    }
+    out.push(text.slice(pos));
+    return out;
+}
+// The smallest changed span between two strings, with room for context around it.
+function hunkOf(a, b) {
+    let p = 0;
+    while (p < a.length && p < b.length && a[p] === b[p]) p++;
+    let q = 0;
+    while (q < a.length - p && q < b.length - p && a[a.length - 1 - q] === b[b.length - 1 - q]) q++;
+    return { p, oldMid: a.slice(p, a.length - q), newMid: b.slice(p, b.length - q), tail: a.length - q, src: a };
+}
+/** Our wording changes (base → fixed) carried over into `current`; null if they no longer fit anywhere. */
+function mergeEdit(base, fixed, current) {
+    const B = mask(base);
+    const bp = B.masked.split(/⟦\d+⟧/);
+    const fp = piecesBy(fixed, B.keep);
+    if (!fp || fp.length !== bp.length) return null;
+    let out = current;
+    let cursor = 0;
+    for (let i = 0; i < bp.length; i++) {
+        if (bp[i] === fp[i]) continue;
+        const h = hunkOf(bp[i], fp[i]);
+        let done = false;
+        for (const L of [48, 24, 10]) {
+            const pre = h.src.slice(Math.max(0, h.p - L), h.p);
+            const post = h.src.slice(h.tail, h.tail + L);
+            const needle = pre + h.oldMid + post;
+            if (needle.length < 6) continue;
+            // pieces go in order, so the first match after the previous one wins; otherwise only an unambiguous match
+            let at = out.indexOf(needle, cursor);
+            if (at === -1) { const k = out.indexOf(needle); at = k !== -1 && k === out.lastIndexOf(needle) ? k : -1; }
+            if (at === -1) continue;
+            out = out.slice(0, at) + pre + h.newMid + post + out.slice(at + needle.length);
+            cursor = at + pre.length + h.newMid.length;
+            done = true;
+            break;
+        }
+        if (!done) return null;
+    }
+    return out;
 }
 
 // ─── The edit itself ───
@@ -491,14 +623,16 @@ async function requestProfile(profileId, messages, maxTokens, signal) {
     const svc = ctx()?.ConnectionManagerRequestService;
     if (!svc?.sendRequest) throw new Error('Connection Manager недоступен');
     const opts = { stream: false, signal, extractData: true, includePreset: true, includeInstruct: true };
-    let res;
-    try {
-        res = await svc.sendRequest(profileId, messages, maxTokens, opts);
-    } catch (e) {
-        if (signal?.aborted) throw e;
-        // some text-completion builds want a plain string instead of a message list
-        res = await svc.sendRequest(profileId, messages.map(m => m.content).join('\n\n'), maxTokens, opts);
+    // [system, user] fits every prompt post-processing mode (none, merge, semi, strict, single); if a backend
+    // still refuses, try one user message, then a plain string (some text-completion builds want that)
+    const flat = messages.map(m => m.content).join('\n\n');
+    const tries = [messages, [{ role: 'user', content: flat }], flat];
+    let res, last;
+    for (const prompt of tries) {
+        try { res = await svc.sendRequest(profileId, prompt, maxTokens, opts); last = null; break; }
+        catch (e) { if (signal?.aborted) throw e; last = e; }
     }
+    if (last) throw last;
     return typeof res === 'string' ? res : (res?.content ?? '');
 }
 
@@ -582,20 +716,44 @@ async function editText(text, words, signal) {
     }
 }
 
-function applyText(id, msg, text) {
+// The same message identity across a chat reload (ExtBlocks and others may reload the chat: the message objects
+// are rebuilt, but the reply is the same one).
+const msgSig = (m) => `${stamp(m?.send_date)}|${m?.name ?? ''}|${m?.is_user ? 1 : 0}`;
+
+function applyText(id, msg, text, { announce = false } = {}) {
     const c = ctx();
+    const old = msg.mes;
     msg.mes = text;
     if (Array.isArray(msg.swipes) && msg.swipes.length) msg.swipes[msg.swipe_id ?? 0] = text;
+    // Some extensions show the reply through extra.display_text instead of mes: ExtBlocks keeps «reply + its
+    // blocks» there, and an image generator may already have put a finished image into those blocks. Swap only
+    // the reply part in place — the blocks and everything in them stay exactly as they are.
+    let display = 'none';
+    const dt = msg.extra?.display_text;
+    if (typeof dt === 'string' && dt) {
+        if (old && dt.startsWith(old)) { msg.extra.display_text = text + dt.slice(old.length); display = 'patched'; }
+        else if (old && dt.includes(old)) { msg.extra.display_text = dt.replace(old, () => text); display = 'patched'; }
+        else display = 'foreign';                     // someone else's text (a translation, say) — its owner redraws it
+    }
     const el = mesEl(id);
-    if (!el) return;                                  // not drawn yet — the tavern will draw the fixed text itself
-    try {
-        if (typeof c.updateMessageBlock === 'function') c.updateMessageBlock(id, msg);
-        else {
-            const t = el.querySelector('.mes_text');
-            if (t && c.messageFormatting) t.innerHTML = c.messageFormatting(text, msg.name, msg.is_system, msg.is_user, id);
+    if (el) {
+        try {
+            if (typeof c.updateMessageBlock === 'function') c.updateMessageBlock(id, msg);
+            else {
+                const t = el.querySelector('.mes_text');
+                if (t && c.messageFormatting) t.innerHTML = c.messageFormatting(msg.extra?.display_text || text, msg.name, msg.is_system, msg.is_user, id);
+            }
+        } catch (e) {
+            console.warn('[Primal Catharsis] could not redraw the message:', e);
         }
-    } catch (e) {
-        console.warn('[Primal Catharsis] could not redraw the message:', e);
+    }
+    // Only the wording changed (technical parts are the same), so «updated», never «edited»: trackers don't roll
+    // back and recount the turn, and ExtBlocks doesn't treat the chat as modified. A drawn message gets the nudge
+    // so extensions can put their bits back; so does a display_text we couldn't patch ourselves. A display_text we
+    // DID patch gets no nudge: its owner would rebuild it from scratch and could drop an image generated into it.
+    const E = c.event_types || {};
+    if (E.MESSAGE_UPDATED && ((announce && el && display === 'none') || display === 'foreign')) {
+        c.eventSource?.emit?.(E.MESSAGE_UPDATED, id, { source: 'PrimalCatharsis', reason: 'wording' });
     }
     // the tavern saves after the generation anyway; this is a safety net for the streaming path
     const chatId = currentChat();
@@ -728,13 +886,9 @@ function swapVersion(id) {
     const data = getData(msg);
     if (!msg || !data?.alt) return;
     const now = msg.mes;
-    applyText(id, msg, transplant(data.alt, now));
+    applyText(id, msg, transplant(data.alt, now), { announce: true });
     patchData(msg, data.at, { alt: now, showingOrig: !data.showingOrig });
     ensure(id);
-    // only the visible wording changed (technical parts are identical in both versions), so no «edited»
-    // event: trackers would roll back and recount the turn, and calendars would re-ask about occasions
-    const E = c.event_types || {};
-    if (E.MESSAGE_UPDATED) c.eventSource?.emit?.(E.MESSAGE_UPDATED, id);
     toast('info', data.showingOrig ? 'Вернули оригинал. Зверь на свободе — под твою ответственность.' : 'Правку вернули. Намордник на месте.');
 }
 
@@ -864,9 +1018,11 @@ async function roast(id, data) {
     if (!text) { text = canned(data); by = pid ? 'fallback' : 'canned'; }
     if (currentChat() !== chatId) return;          // the player switched chats meanwhile
     kenRemember(text);
-    patchData(msg, data.at, { comment: text, by });
+    const now = ctx()?.chat?.[id];
+    if (!now || (now !== msg && msgSig(now) !== msgSig(msg))) return;
+    patchData(now, data.at, { comment: text, by });
     if (usable) ctx()?.saveChat?.();               // the reply was saved long ago; save the late comment too
-    if (ctx()?.chat?.[id] === msg) ensure(id, { typed: true });
+    ensure(id, { typed: true });
 }
 
 // ─── The report in the chat ───
@@ -1045,7 +1201,7 @@ function place(el, box, id) {
 function ensure(id, { typed = false } = {}) {
     const el = mesEl(id);
     if (!el) return;
-    if (shamedId === id) mark(id, shamedLabel);
+    if (shamed.has(id)) mark(id, shamed.get(id));
     const data = getData(ctx()?.chat?.[id]);
     const show = !!data && !!(data.cuts?.length || data.left?.length) && settings().showLog !== false;
     let box = null;
@@ -1171,6 +1327,14 @@ function profileOptions(cur, emptyLabel) {
     return opts.join('');
 }
 
+function modeHint() {
+    const m = settings().fixMode;
+    if (m === 'strict') return 'Ответ не покажется, пока его не поправят. С внешними блоками и генерацией картинок лучше «Авто».';
+    if (m === 'background') return 'Ответ сразу уходит в чат и другим расширениям, но виден только под мылом, пока его правят.';
+    const sens = pipelineSensitive();
+    return sens.value ? `Сейчас: в фоне — ${sens.why}.` : 'Сейчас: до показа.';
+}
+
 function fixHint() {
     const pid = settings().fixProfile;
     const list = profiles();
@@ -1223,6 +1387,15 @@ function popupHtml() {
                         <button type="button" class="pc-switch" role="switch" data-pc="log" aria-labelledby="pc-log-label"></button>
                     </div>
                     <div class="pc-field">
+                        <label for="pc-mode" class="pc-label"><i class="fa-solid fa-clock"></i> Когда править</label>
+                        <select id="pc-mode" class="text_pole pc-select" data-pc-set="fixMode">
+                            <option value="auto"${s.fixMode === 'auto' || !s.fixMode ? ' selected' : ''}>Авто</option>
+                            <option value="strict"${s.fixMode === 'strict' ? ' selected' : ''}>До показа</option>
+                            <option value="background"${s.fixMode === 'background' ? ' selected' : ''}>В фоне, под мылом</option>
+                        </select>
+                        <small class="pc-hint" data-for="mode"></small>
+                    </div>
+                    <div class="pc-field">
                         <label for="pc-fix" class="pc-label"><i class="fa-solid fa-pen-nib"></i> Редактор</label>
                         <select id="pc-fix" class="text_pole pc-select" data-pc-set="fixProfile">${profileOptions(s.fixProfile, 'Основное подключение')}</select>
                         <small class="pc-hint" data-for="fix"></small>
@@ -1269,6 +1442,7 @@ function paintPopup(wrap, flip = false) {
     seg.querySelectorAll('[role="radio"]').forEach(b => b.setAttribute('aria-checked', String((b.dataset.pc === 'on') === on)));
     wrap.querySelector('[data-pc="log"]').setAttribute('aria-checked', String(s.showLog !== false));
     wrap.querySelector('[data-pc="stream"]').setAttribute('aria-checked', String(s.hideStream !== false));
+    wrap.querySelector('.pc-hint[data-for="mode"]').textContent = modeHint();
     wrap.querySelector('.pc-hint[data-for="fix"]').textContent = fixHint();
     wrap.querySelector('.pc-hint[data-for="comment"]').textContent = commentHint();
     const mem = (s.kenMemory || []).length;
@@ -1441,8 +1615,25 @@ function init() {
     });
     if (E.GENERATION_ENDED) eventSource.on(E.GENERATION_ENDED, release);
     // the stop button during an edit means «stop waiting»: keep the reply as it came
-    if (E.GENERATION_STOPPED) eventSource.on(E.GENERATION_STOPPED, () => { job?.ctrl.abort(); release(); });
-    eventSource.on(E.CHAT_CHANGED, () => { job?.ctrl.abort(); job = null; armed = false; skipped.clear(); shamedId = null; inject(); tidyChat(); setTimeout(renderAll, 60); });
+    // the stop button during a held edit means «stop waiting»; background edits of earlier replies keep going
+    if (E.GENERATION_STOPPED) eventSource.on(E.GENERATION_STOPPED, () => { for (const j of jobs.values()) if (j.held) j.ctrl.abort(); release(); });
+    let lastChatId = currentChat();
+    eventSource.on(E.CHAT_CHANGED, () => {
+        const nowId = currentChat();
+        const reload = !!nowId && nowId === lastChatId;      // ExtBlocks /extblocks-flushinjects, preset switches…
+        lastChatId = nowId;
+        armed = false;
+        sensitiveCache.at = 0;
+        if (!reload) {                                        // a different chat: everything in flight is moot
+            for (const j of jobs.values()) j.ctrl.abort();
+            jobs.clear();
+            skipped.clear();
+            shamed.clear();
+        }                                                     // a reload: edits keep going, soap comes back with the redraw
+        inject();
+        tidyChat();
+        setTimeout(renderAll, 60);
+    });
     for (const ev of [E.CHARACTER_MESSAGE_RENDERED, E.MESSAGE_SWIPED, E.MESSAGE_UPDATED, E.MESSAGE_EDITED]) {
         if (ev) eventSource.on(ev, (id) => renderSoon(Number(id)));
     }
