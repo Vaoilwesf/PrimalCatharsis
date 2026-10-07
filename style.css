@@ -291,7 +291,11 @@
 .pc-toast .toast-progress { height: 3px; opacity: 0.55; background-color: var(--pc-k) !important; }
 
 /* ─── Пойманный ответ ждёт правки размытым, с мыльной плашкой ─── */
-.mes.pc-shamed .mes_text { filter: blur(5px); opacity: 0.5; transition: filter calc(var(--pc-t) * 3) ease, opacity calc(var(--pc-t) * 3) ease; }
+.mes.pc-shamed .mes_text:not(:has(.iig-loading-placeholder)),
+/* пока в сообщении рисуется картинка, размываем только текст — спиннер генератора остаётся видно */
+.mes.pc-shamed .mes_text:has(.iig-loading-placeholder) > :not(.iig-loading-placeholder):not(:has(.iig-loading-placeholder)) {
+    filter: blur(5px); opacity: 0.5; transition: filter calc(var(--pc-t) * 3) ease, opacity calc(var(--pc-t) * 3) ease;
+}
 .mes.pc-shamed .mes_block { position: relative; }
 .pc-soap {
     position: absolute; left: 50%; top: 55%; z-index: 2;

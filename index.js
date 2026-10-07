@@ -154,10 +154,49 @@ function htmlRanges(t) {
     return out;
 }
 
+// Image-generator tags (Nyaa-Rakk / Inline Image Gen and the like). Models often write them as broken HTML, so a
+// plain tag regex cuts them at the first «>» inside the prompt — instead, follow the JSON by its braces, exactly as
+// the generator does:  <img|video … data-iig-instruction='{…}' src="…">   [IMG:GEN:{…}]   [IMG:✓:…] [IMG:ERROR:…]
+function jsonEnd(t, from) {
+    let depth = 0, inStr = false, esc = false;
+    for (let i = from; i < t.length; i++) {
+        const ch = t[i];
+        if (esc) { esc = false; continue; }
+        if (ch === '\\' && inStr) { esc = true; continue; }
+        if (ch === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (ch === '{') depth++;
+        else if (ch === '}' && --depth === 0) return i + 1;
+    }
+    return -1;
+}
+function mediaTagRanges(t) {
+    const out = [];
+    const marker = 'data-iig-instruction=';
+    for (let pos = t.indexOf(marker); pos !== -1; pos = t.indexOf(marker, pos + 1)) {
+        const start = Math.max(t.lastIndexOf('<img', pos), t.lastIndexOf('<video', pos));
+        if (start === -1 || pos - start > 800) continue;
+        const brace = t.indexOf('{', pos + marker.length);
+        let end = brace !== -1 && brace <= pos + marker.length + 10 ? jsonEnd(t, brace) : -1;
+        end = t.indexOf('>', end === -1 ? pos : end);
+        if (end === -1) continue;
+        out.push([start, end + 1]);
+        pos = end;
+    }
+    for (let pos = t.indexOf('[IMG:GEN:'); pos !== -1; pos = t.indexOf('[IMG:GEN:', pos + 1)) {
+        const end = jsonEnd(t, pos + 9);
+        if (end === -1) continue;
+        const close = t.indexOf(']', end);
+        out.push([pos, close !== -1 && close - end < 8 ? close + 1 : end]);
+    }
+    for (const m of t.matchAll(/\[IMG:(?:GEN|✓|ERROR)[^\]\n]*\]/g)) out.push([m.index, m.index + m[0].length]);
+    return out;
+}
+
 /** Sorted, merged [start, end) ranges of everything technical in the text */
 function protectedRanges(text) {
     const t = String(text || '');
-    const ranges = htmlRanges(t);
+    const ranges = [...htmlRanges(t), ...mediaTagRanges(t)];
     for (const re of [...TECH, ...customDetectors()]) {
         re.lastIndex = 0;
         for (const m of t.matchAll(re)) if (m[0].length) ranges.push([m.index, m.index + m[0].length]);
@@ -380,23 +419,29 @@ function pipelineSensitive() {
         const set = eb.sets?.[eb.active_set_idx];
         const scoped = c?.characters?.[c?.characterId]?.data?.extensions?.ExtBlocks;
         const blocks = [...(Array.isArray(set?.global_blocks) ? set.global_blocks : []), ...(Array.isArray(scoped) ? scoped : [])];
-        if (blocks.some(b => b && !b.disabled && (b.char_message || b.generation_pause))) why = 'включён ExtBlocks';
+        if (blocks.some(b => b && !b.disabled && (b.char_message || b.generation_pause))) why = 'ExtBlocks';
     }
-    if (!why && walk(es, 0)) why = 'подключены внешние блоки';
-    if (!why) {
+    if (!why && walk(es, 0)) why = 'внешние блоки';
+    if (es.inline_image_gen?.enabled) why = why ? `${why} и генератор картинок` : 'генератор картинок';
+    if (!why && !es.inline_image_gen?.enabled) {
         const chat = ctx()?.chat || [];
         for (let i = chat.length - 1; i >= Math.max(0, chat.length - 8); i--) {
-            if (/data-iig-instruction|\[IMG:GEN\]/i.test(chat[i]?.mes || '')) { why = 'в чате генерируются картинки'; break; }
+            if (/data-iig-instruction|\[IMG:GEN\]/i.test(chat[i]?.mes || '')) { why = 'генерация картинок'; break; }
         }
-        if (!why && document.querySelector('#chat [data-iig-instruction]')) why = 'в чате генерируются картинки';
+        if (!why && document.querySelector('#chat [data-iig-instruction]')) why = 'генерация картинок';
     }
     sensitiveCache = { at: Date.now(), value: !!why, why };
     return sensitiveCache;
 }
-function fixMode() {
+// How long the tavern waits for us: strict — until the reply is clean; auto — up to AUTO_HOLD, then the reply goes on
+// and the edit finishes in the background; background — not at all. ExtBlocks and image generators start only once
+// the reply is drawn, so holding means they work on the clean text and nothing gets redrawn under them.
+const AUTO_HOLD = 20000;
+function holdBudget() {
     const m = settings().fixMode;
-    if (m === 'strict' || m === 'background') return m;
-    return pipelineSensitive().value ? 'background' : 'strict';
+    if (m === 'strict') return Infinity;
+    if (m === 'background') return 0;
+    return AUTO_HOLD;
 }
 
 // The tavern awaits this. In the strict mode we keep it waiting until the reply is clean;
@@ -416,9 +461,18 @@ async function onReceived(id, type) {
         finalize(id, { cuts: [], left: hits, attempts: 0, orig: null });
         return;
     }
-    const held = fixMode() === 'strict';
-    const run = fixReply(id, msg, hits, held).catch(e => console.warn('[Primal Catharsis] the fix failed:', e));
-    if (held) await run;
+    const budget = holdBudget();
+    const run = fixReply(id, msg, hits, budget > 0).catch(e => console.warn('[Primal Catharsis] the fix failed:', e));
+    if (budget === Infinity) return void await run;
+    if (budget <= 0) return;
+    let timer;
+    const late = new Promise(resolve => { timer = setTimeout(() => resolve('late'), budget); });
+    const how = await Promise.race([run.then(() => 'done'), late]);
+    clearTimeout(timer);
+    if (how === 'late') {                              // taking too long: let the reply go on, keep fixing it under soap
+        const j = jobs.get(id);
+        if (j) j.held = false;
+    }
 }
 
 async function fixReply(id, msg, hits, held) {
@@ -467,7 +521,7 @@ async function fixReply(id, msg, hits, held) {
             const now = cur();
             const merged = now.mes === base ? text : mergeEdit(base, text, now.mes);
             if (merged !== null) {
-                applyText(id, now, merged, { announce: !held });
+                applyText(id, now, merged, { announce: !jobs.get(id)?.held });
                 applied = true;
                 break;
             }
@@ -736,6 +790,13 @@ function applyText(id, msg, text, { announce = false } = {}) {
         else display = 'foreign';                     // someone else's text (a translation, say) — its owner redraws it
     }
     const el = mesEl(id);
+    // An image generator is drawing into this message right now (its spinner replaced the <img>): a redraw would
+    // throw the spinner away and show a dead [IMG:GEN] until it finishes. The storage is already fixed, and the
+    // generator redraws from it when it's done — we only redraw afterwards, as a safety net.
+    if (el && generatingIn(el)) {
+        afterImages(id, () => { const m = ctx()?.chat?.[id]; if (m === msg) applyText(id, msg, msg.mes, { announce }); });
+        return saveSoon();
+    }
     if (el) {
         try {
             if (typeof c.updateMessageBlock === 'function') c.updateMessageBlock(id, msg);
@@ -755,9 +816,29 @@ function applyText(id, msg, text, { announce = false } = {}) {
     if (E.MESSAGE_UPDATED && ((announce && el && display === 'none') || display === 'foreign')) {
         c.eventSource?.emit?.(E.MESSAGE_UPDATED, id, { source: 'PrimalCatharsis', reason: 'wording' });
     }
-    // the tavern saves after the generation anyway; this is a safety net for the streaming path
+    saveSoon();
+}
+// the tavern saves after the generation anyway; this is a safety net for the streaming path
+function saveSoon() {
     const chatId = currentChat();
     setTimeout(() => { if (currentChat() === chatId) ctx()?.saveChat?.(); }, 1500);
+}
+
+const IMG_BUSY = '.iig-loading-placeholder, .iig-spinner';
+const generatingIn = (el) => !!el?.querySelector?.(IMG_BUSY);
+const waitingImages = new Map();     // message id → callbacks to run once its images are done
+function afterImages(id, fn) {
+    if (waitingImages.has(id)) { waitingImages.get(id).push(fn); return; }
+    waitingImages.set(id, [fn]);
+    const started = Date.now();
+    const tick = () => {
+        const el = mesEl(id);
+        if (el && generatingIn(el) && Date.now() - started < 5 * 60000) return void setTimeout(tick, 600);
+        const fns = waitingImages.get(id) || [];
+        waitingImages.delete(id);
+        fns.forEach(f => { try { f(); } catch (e) { console.warn('[Primal Catharsis]', e); } });
+    };
+    setTimeout(tick, 600);
 }
 
 // ─── The report: what was cut ───
@@ -1329,10 +1410,10 @@ function profileOptions(cur, emptyLabel) {
 
 function modeHint() {
     const m = settings().fixMode;
-    if (m === 'strict') return 'Ответ не покажется, пока его не поправят. С внешними блоками и генерацией картинок лучше «Авто».';
-    if (m === 'background') return 'Ответ сразу уходит в чат и другим расширениям, но виден только под мылом, пока его правят.';
+    if (m === 'strict') return 'Ответ покажется только исправленным, сколько бы ни шла правка.';
+    if (m === 'background') return 'Ответ сразу уходит в чат и другим расширениям, но виден под мылом, пока его правят.';
     const sens = pipelineSensitive();
-    return sens.value ? `Сейчас: в фоне — ${sens.why}.` : 'Сейчас: до показа.';
+    return `Ждём правку до ${AUTO_HOLD / 1000} с, потом ответ уходит дальше и дочищается в фоне.${sens.value ? ` Подключены ${sens.why}: они начнут работу уже с исправленного текста.` : ''}`;
 }
 
 function fixHint() {
