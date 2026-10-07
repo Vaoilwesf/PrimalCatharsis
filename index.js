@@ -28,7 +28,15 @@ const KEEP_ORIGINALS = 30;   // «вернуть как было» stays availab
 const POS = { IN_CHAT: 1, BEFORE_PROMPT: 2 };
 const ROLE_SYSTEM = 0;
 
-const ctx = () => globalThis.SillyTavern?.getContext?.();
+// getContext() builds a fresh object of a few hundred fields on every call — far too pricey for hot paths
+// (the chat watcher, a full redraw, streaming). Those run inside batch(): one snapshot for the whole synchronous run.
+let ctxSnap = null;
+const ctx = () => ctxSnap || globalThis.SillyTavern?.getContext?.();
+function batch(fn) {
+    if (ctxSnap) return fn();
+    ctxSnap = globalThis.SillyTavern?.getContext?.() || null;
+    try { return fn(); } finally { ctxSnap = null; }
+}
 
 // ─── What counts as "primal" ───
 // English and Russian. Forms and declensions are covered by stems.
@@ -337,8 +345,7 @@ function mark(id, label = 'моем рот с мылом…') {
         tag = document.createElement('div');
         tag.className = 'pc-soap';
         tag.innerHTML = '<i class="fa-solid fa-soap"></i><span class="pc-soap-text"></span>'
-            + '<button type="button" class="pc-soap-skip" data-pc-skip title="Не ждать — оставить ответ как есть" aria-label="Оставить ответ как есть"><i class="fa-solid fa-xmark"></i></button>'
-            + '<b class="pc-bubble"></b>'.repeat(5);
+            + '<button type="button" class="pc-soap-skip" data-pc-skip title="Не ждать — оставить ответ как есть" aria-label="Оставить ответ как есть"><i class="fa-solid fa-xmark"></i></button>';
         block.appendChild(tag);
     }
     const text = tag.querySelector('.pc-soap-text');
@@ -375,17 +382,29 @@ function releaseToasts(dlg) {
 }
 
 // While streaming: the moment a banned phrase shows up, the reply goes under soap.
+// Cheap on purpose: twice a second, one combined regexp over the freshly streamed tail; the full check (with all the
+// technical-part protection) only runs when that tail looks suspicious — and stops once the reply is under soap.
+let QUICK = null;
+try { QUICK = new RegExp(BANNED.map(r => `(?:${r.source})`).join('|'), 'iu'); } catch { QUICK = null; }
+let streamSeen = 0;
 function onStreamToken(text) {
-    if (!isOn() || settings().hideStream === false || genType === 'impersonate' || genType === 'quiet') return;
+    if (!armed || genType === 'impersonate' || genType === 'quiet') return;
     const now = Date.now();
-    if (now - streamCheckAt < 250) return;
+    if (now - streamCheckAt < 500) return;            // the throttle goes first: everything below costs something
     streamCheckAt = now;
-    const c = ctx();
-    const id = (c?.chat?.length ?? 0) - 1;
-    const msg = c?.chat?.[id];
-    if (!armed || id <= 0 || !msg || msg.is_user || msg.is_system || shamed.has(id) || skipped.has(id)) return;
-    const t = typeof text === 'string' && text ? text : msg.mes;
-    if (findPrimalDetailed(t).length) mark(id, 'ловим зверя на лету…');
+    batch(() => {
+        if (!isOn() || settings().hideStream === false) return;
+        const c = ctx();
+        const id = (c?.chat?.length ?? 0) - 1;
+        const msg = c?.chat?.[id];
+        if (id <= 0 || !msg || msg.is_user || msg.is_system || shamed.has(id) || skipped.has(id)) return;
+        const t = typeof text === 'string' && text ? text : String(msg.mes || '');
+        if (t.length < streamSeen) streamSeen = 0;                       // a new stream (or the text was replaced)
+        const tail = t.slice(Math.max(0, streamSeen - 80));
+        streamSeen = t.length;
+        if (QUICK && !QUICK.test(tail)) return;
+        if (findPrimalDetailed(t).length) mark(id, 'ловим зверя на лету…');
+    });
 }
 
 function addCuts(bag, hits) {
@@ -1111,10 +1130,16 @@ const plural = (n, [one, few, many]) => {
     const a = n % 100, b = n % 10;
     return a > 10 && a < 20 ? many : b === 1 ? one : b >= 2 && b <= 4 ? few : many;
 };
+let calmCache = { at: 0, value: false };
 const calm = () => {
-    if (globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return true;
-    const v = getComputedStyle(document.documentElement).getPropertyValue('--animation-duration').trim();
-    return v === '0ms' || v === '0s' || v === '0';
+    if (Date.now() - calmCache.at < 3000) return calmCache.value;
+    let value = !!globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    if (!value) {
+        const v = getComputedStyle(document.documentElement).getPropertyValue('--animation-duration').trim();
+        value = v === '0ms' || v === '0s' || v === '0';
+    }
+    calmCache = { at: Date.now(), value };
+    return value;
 };
 
 function logHtml(data) {
@@ -1163,25 +1188,6 @@ function byLabel(by) {
     return `— ${KEN}`;
 }
 
-// typing without growing: the whole text is laid out from the start, the untyped rest is just invisible
-function typeInto(el, text) {
-    el.innerHTML = '<span class="pc-typed"></span><span class="pc-ghost"></span>';
-    const [typed, ghost] = el.children;
-    ghost.textContent = text;
-    el.classList.add('pc-typing');
-    let i = 0;
-    const step = Math.max(1, Math.round(text.length / 60));
-    const done = () => { el.textContent = text; el.classList.remove('pc-typing'); };
-    const tick = () => {
-        if (!el.isConnected) return done();
-        i = Math.min(text.length, i + step);
-        typed.textContent = text.slice(0, i);
-        ghost.textContent = text.slice(i);
-        if (i < text.length) setTimeout(tick, 22);
-        else done();
-    };
-    tick();
-}
 
 function paintComment(box, data, state, typed) {
     const say = box.querySelector('.pc-log-say');
@@ -1192,12 +1198,12 @@ function paintComment(box, data, state, typed) {
     }
     const text = data.comment || canned(data);
     say.innerHTML = `<span class="pc-log-text"></span><small class="pc-log-by">${byLabel(state === 'cold' ? 'canned' : data.by)}</small>`;
-    const t = say.querySelector('.pc-log-text');
-    if (typed && !calm()) typeInto(t, text);
-    else t.textContent = text;
-    say.classList.remove('pc-pop');
-    void say.offsetWidth;
-    say.classList.add('pc-pop');
+    say.querySelector('.pc-log-text').textContent = text;
+    if (typed && !calm()) {                            // a fresh line from Ken fades in; a redraw just shows it
+        say.classList.remove('pc-pop');
+        void say.offsetWidth;
+        say.classList.add('pc-pop');
+    }
 }
 
 // One live element per report, reused forever: if someone throws it out of the message,
@@ -1212,7 +1218,8 @@ function nodeFor(data) {
     box.className = 'pc-log' + (data.verdict === 'beast' && data.left.length ? ' pc-beast' : '');
     box.dataset.at = String(data.at);
     box.innerHTML = logHtml(data);
-    box.addEventListener('animationend', (e) => { if (e.target === box) box.classList.add('pc-still'); });
+    if (Date.now() - (data.at || 0) > 15000) box.classList.add('pc-still');   // an old report: no entrance on chat load
+    else box.addEventListener('animationend', (e) => { if (e.target === box) box.classList.add('pc-still'); }, { once: true });
     nodes.set(data.at, box);
     if (nodes.size > 300) nodes.delete(nodes.keys().next().value);
     return box;
@@ -1257,7 +1264,9 @@ function place(el, box, id) {
     const at = anchorOf(el, id);
     if (!at) return;
     const { parent, after } = at;
-    box.classList.toggle('pc-inline', parent.classList.contains('mes_text'));
+    const inline = parent.classList.contains('mes_text');
+    box.classList.toggle('pc-inline', inline);
+    if (inline) inlineHosts.add(parent);
     const inPlace = box.parentNode === parent && (after ? box.previousElementSibling === after : parent.firstElementChild === box);
     if (inPlace) return;
     const now = Date.now();
@@ -1279,8 +1288,8 @@ function place(el, box, id) {
 }
 
 /** Make the message show exactly what it should: its own report in its spot, nothing stray */
-function ensure(id, { typed = false } = {}) {
-    const el = mesEl(id);
+function ensure(id, { typed = false, el = null } = {}) {
+    el ||= mesEl(id);
     if (!el) return;
     if (shamed.has(id)) mark(id, shamed.get(id));
     const data = getData(ctx()?.chat?.[id]);
@@ -1298,34 +1307,61 @@ function ensure(id, { typed = false } = {}) {
     if (box) place(el, box, id);
 }
 
-const renderSoon = (id) => setTimeout(() => ensure(id), 0);
+const renderSoon = (id) => setTimeout(() => batch(() => ensure(id)), 0);
 function renderAll() {
-    document.querySelectorAll('#chat .mes[mesid]').forEach(el => ensure(Number(el.getAttribute('mesid'))));
+    batch(() => document.querySelectorAll('#chat .mes[mesid]').forEach(el => ensure(Number(el.getAttribute('mesid')), { el })));
 }
 
-// Watches the chat for anyone rewriting messages. Observer callbacks run before the browser paints,
-// so a block that got knocked out is back before it could ever be seen missing.
+// Watches the chat for anyone throwing our block or soap out. It used to look at every change in the chat — every
+// streamed token, every timer of every other extension. Now it only reacts to what concerns us: a message added or
+// replaced, our own block or soap removed, or something squeezed in right where our block lives. Everything else is
+// skipped after a couple of property checks. Callbacks run before the browser paints, so a knocked-out block is back
+// before it could ever be seen missing.
+const isOurs = (n) => n.classList.contains('pc-log') || n.classList.contains('pc-soap');
+// a removed node that could have carried our block or soap: our own node, or a message part that hosts them
+function carriedOurs(n) {
+    if (n.nodeType !== 1) return false;
+    if (isOurs(n)) return true;
+    const cl = n.classList;
+    if (!(cl.contains('mes_text') || cl.contains('mes_block') || cl.contains('mes')) || !n.firstElementChild) return false;
+    return n.getElementsByClassName('pc-log').length > 0 || n.getElementsByClassName('pc-soap').length > 0;
+}
+const inlineHosts = new WeakSet();       // .mes_text elements our block sits in (after an inline <think>)
 function watchChat() {
-    const chat = document.getElementById('chat');
-    if (!chat) return void setTimeout(watchChat, 500);
+    const chatEl = document.getElementById('chat');
+    if (!chatEl) return void setTimeout(watchChat, 500);
     new MutationObserver((muts) => {
-        const touched = new Set();
+        let touched = null;
+        const touch = (mes) => { if (mes) (touched ||= new Set()).add(mes); };
         for (const m of muts) {
-            const t = m.target.nodeType === 1 ? m.target : m.target.parentElement;
-            if (!t || t.closest('.pc-log, .pc-soap')) continue;  // our own typing, toggles and soap
-            const mes = t.closest('.mes');
-            if (mes) { touched.add(mes); continue; }
-            for (const n of m.addedNodes) {                       // whole messages added or replaced
-                if (n.nodeType !== 1) continue;
-                if (n.matches('.mes')) touched.add(n);
-                else n.querySelectorAll?.('.mes').forEach(x => touched.add(x));
+            const t = m.target;
+            if (t === chatEl) {                                        // whole messages added or replaced
+                for (const n of m.addedNodes) if (n.nodeType === 1 && n.classList.contains('mes')) touch(n);
+                continue;
+            }
+            if (t.nodeType !== 1) continue;
+            const cl = t.classList;
+            const frame = cl.contains('mes_block');
+            const inline = !frame && inlineHosts.has(t);
+            // inside the reply text (where every streamed token lands) there is nothing of ours — skip at once
+            if (!frame && !inline && !cl.contains('mes')) continue;
+            let ours = false;                                          // our block or soap was thrown out
+            for (const n of m.removedNodes) if (carriedOurs(n)) { ours = true; break; }
+            if (ours) { touch(t.closest('.mes')); continue; }
+            // something new landed in a message's frame, or next to our block inside the text (after a <think>)
+            if (inline && m.addedNodes.length) touch(t.closest('.mes'));
+            else if (frame) {
+                for (const n of m.addedNodes) if (n.nodeType === 1 && !isOurs(n)) { touch(t.closest('.mes')); break; }
             }
         }
-        for (const mes of touched) {
-            const id = Number(mes.getAttribute('mesid'));
-            if (Number.isFinite(id)) ensure(id);
-        }
-    }).observe(chat, { childList: true, subtree: true });
+        if (!touched) return;
+        batch(() => {
+            for (const mes of touched) {
+                const id = Number(mes.getAttribute('mesid'));
+                if (Number.isFinite(id)) ensure(id, { el: mes });
+            }
+        });
+    }).observe(chatEl, { childList: true, subtree: true });
 }
 
 const tMs = () => {
@@ -1692,6 +1728,7 @@ function init() {
         if (dryRun) return;
         genType = type;
         streamCheckAt = 0;
+        streamSeen = 0;
         if (!NOT_A_REPLY.has(type)) armed = true;
     });
     if (E.GENERATION_ENDED) eventSource.on(E.GENERATION_ENDED, release);
@@ -1715,7 +1752,8 @@ function init() {
         tidyChat();
         setTimeout(renderAll, 60);
     });
-    for (const ev of [E.CHARACTER_MESSAGE_RENDERED, E.MESSAGE_SWIPED, E.MESSAGE_UPDATED, E.MESSAGE_EDITED]) {
+    // the reasoning block filling in or being edited moves our block below it — the tavern announces those
+    for (const ev of [E.CHARACTER_MESSAGE_RENDERED, E.MESSAGE_SWIPED, E.MESSAGE_UPDATED, E.MESSAGE_EDITED, E.MESSAGE_REASONING_EDITED, E.MESSAGE_REASONING_DELETED]) {
         if (ev) eventSource.on(ev, (id) => renderSoon(Number(id)));
     }
     for (const ev of [E.MESSAGE_DELETED, E.MORE_MESSAGES_LOADED]) {

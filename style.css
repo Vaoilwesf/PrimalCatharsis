@@ -1,6 +1,7 @@
 /* Primal Catharsis — глубоко несерьёзное оформление, которое честно берёт цвета и шрифт из темы таверны.
-   Анимируются только transform и opacity (и одно переключение display при раскрытии), длительности завязаны
-   на --animation-duration таверны: её «Уменьшить анимацию» и системный reduced motion всё выключают. */
+   Лёгкое для телефонов: ни одной бесконечной анимации, ни размытия фона (backdrop-filter), ни размытия текста
+   (filter: blur), ни селекторов :has(). Анимации одноразовые и только на transform и opacity; длительности
+   завязаны на --animation-duration таверны, так что «Уменьшить анимацию» и системный reduced motion их выключают. */
 
 :root { --pc-t: var(--animation-duration, 125ms); }
 
@@ -60,8 +61,6 @@
     border: 1px solid var(--pc-line); border-radius: 1em;
     background-color: var(--pc-tint);
     background-image: radial-gradient(120% 55% at 50% 0%, color-mix(in srgb, var(--pc-acc) 14%, transparent), transparent 70%);
-    -webkit-backdrop-filter: blur(var(--SmartThemeBlurStrength, 10px));
-    backdrop-filter: blur(var(--SmartThemeBlurStrength, 10px));
     color: var(--pc-fg); font-family: inherit; text-align: left;
     font-size: clamp(12px, 1.85vh, 14.5px); line-height: 1.35;
     box-shadow: 0 18px 50px var(--pc-shadow);
@@ -69,12 +68,10 @@
 }
 #pc-popup.pc-bye .pc-card { animation: pc-card-out calc(var(--pc-t) * 2) ease-in both; }
 
-/* оградительная лента, которая медленно ползёт */
-.pc-tape { position: absolute; inset: 0 0 auto 0; height: 5px; overflow: hidden; border-radius: 1em 1em 0 0; opacity: 0.85; }
-.pc-tape::before {
-    content: ''; position: absolute; top: 0; bottom: 0; left: -40px; right: 0;
+/* оградительная лента */
+.pc-tape {
+    position: absolute; inset: 0 0 auto 0; height: 5px; border-radius: 1em 1em 0 0; opacity: 0.85;
     background: repeating-linear-gradient(-45deg, var(--pc-acc) 0 10px, transparent 10px 20px);
-    animation: pc-tape calc(var(--pc-t) * 14) linear infinite;
 }
 
 /* маленький крестик */
@@ -92,8 +89,7 @@
 .pc-kicker { font-size: 0.74em; color: var(--pc-em); }
 .pc-kicker i { margin-right: 4px; color: var(--pc-acc); }
 #pc-title { margin: 0.15em 0 0.3em; font-size: 1.4em; font-weight: 800; line-height: 1.15; color: var(--pc-acc); }
-#pc-title .pc-wig { display: inline-block; font-size: 0.85em; animation: pc-wiggle calc(var(--pc-t) * 11) ease-in-out infinite; }
-#pc-title .pc-wig + .pc-wig { animation-delay: calc(var(--pc-t) * 5); }
+#pc-title .pc-wig { display: inline-block; font-size: 0.85em; }
 .pc-body { margin: 0 0 0.7em; font-size: 0.92em; }
 .pc-body i { font-style: italic; color: var(--pc-em); background: color-mix(in srgb, var(--pc-acc) 15%, transparent); padding: 0 3px; border-radius: 4px; }
 
@@ -257,7 +253,6 @@
     border-radius: 10px !important;
     background-color: var(--pc-tint) !important;
     background-image: linear-gradient(90deg, color-mix(in srgb, var(--pc-k) 16%, transparent), transparent 65%) !important;
-    -webkit-backdrop-filter: blur(var(--SmartThemeBlurStrength, 10px)); backdrop-filter: blur(var(--SmartThemeBlurStrength, 10px));
     color: var(--pc-fg) !important;
     font-family: var(--mainFontFamily, inherit); line-height: 1.4; text-shadow: none;
     box-shadow: 0 8px 26px var(--pc-shadow) !important;
@@ -290,44 +285,29 @@
 #toast-container > .toast.pc-toast .toast-close-button:hover { color: var(--pc-fg); opacity: 1; transform: rotate(90deg); }
 .pc-toast .toast-progress { height: 3px; opacity: 0.55; background-color: var(--pc-k) !important; }
 
-/* ─── Пойманный ответ ждёт правки размытым, с мыльной плашкой ─── */
-.mes.pc-shamed .mes_text:not(:has(.iig-loading-placeholder)),
-/* пока в сообщении рисуется картинка, размываем только текст — спиннер генератора остаётся видно */
-.mes.pc-shamed .mes_text:has(.iig-loading-placeholder) > :not(.iig-loading-placeholder):not(:has(.iig-loading-placeholder)) {
-    filter: blur(5px); opacity: 0.5; transition: filter calc(var(--pc-t) * 3) ease, opacity calc(var(--pc-t) * 3) ease;
-}
+/* ─── Пойманный ответ ждёт правки под мыльной плашкой ───
+   Текст не размывается (filter: blur на большом сообщении — одна из самых дорогих вещей на телефоне, а при стриминге
+   он пересчитывался на каждом токене), а просто приглушается. Спиннер генератора картинок не приглушается. */
+.mes.pc-shamed .mes_text > :not(.iig-loading-placeholder) { opacity: 0.12; transition: opacity calc(var(--pc-t) * 2) ease; }
 .mes.pc-shamed .mes_block { position: relative; }
 .pc-soap {
     position: absolute; left: 50%; top: 55%; z-index: 2;
-    display: flex; align-items: center; gap: 8px; padding: 6px 14px; border-radius: 999px;
+    display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px;
     transform: translate(-50%, -50%) rotate(-2deg);
     background: var(--pc-tint); color: var(--pc-fg);
-    -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
-    border: 1px solid var(--pc-line); box-shadow: 0 4px 18px var(--pc-shadow);
+    border: 1px solid var(--pc-line); box-shadow: 0 3px 12px var(--pc-shadow);
     font: inherit; font-size: 0.85em; font-weight: 600; white-space: nowrap; pointer-events: none;
-    animation: pc-soap-in calc(var(--pc-t) * 4) var(--pc-spring) both;
+    animation: pc-soap-in calc(var(--pc-t) * 3) var(--pc-spring) both;
 }
-.pc-soap > i { color: var(--pc-acc); animation: pc-scrub calc(var(--pc-t) * 5) ease-in-out infinite; }
+.pc-soap > i { color: var(--pc-acc); }
 .pc-soap-skip {
     all: unset; box-sizing: border-box; pointer-events: auto; cursor: pointer;
-    display: grid; place-items: center; width: 20px; height: 20px; margin-left: 2px; border-radius: 50%;
+    display: grid; place-items: center; width: 22px; height: 22px; margin-left: 2px; border-radius: 50%;
     font-size: 0.85em; color: var(--pc-em);
     background: color-mix(in srgb, var(--pc-fg) 10%, transparent);
-    transition: transform calc(var(--pc-t) * 3) var(--pc-spring), color var(--pc-t), background-color var(--pc-t);
+    transition: transform calc(var(--pc-t) * 2) ease, color var(--pc-t), background-color var(--pc-t);
 }
-.pc-soap-skip:hover { transform: rotate(90deg) scale(1.12); color: var(--pc-fg); background: color-mix(in srgb, var(--pc-bad) 30%, transparent); }
-.pc-soap-skip:active { transform: rotate(90deg) scale(0.88); }
-.pc-bubble {
-    position: absolute; bottom: 70%; width: 8px; height: 8px; border-radius: 50%; opacity: 0;
-    border: 1px solid color-mix(in srgb, var(--pc-acc) 70%, var(--pc-fg));
-    background: color-mix(in srgb, var(--pc-acc) 15%, transparent);
-    animation: pc-bubble calc(var(--pc-t) * 16) ease-out infinite;
-}
-.pc-bubble:nth-of-type(1) { left: 8%; --x: -6px; }
-.pc-bubble:nth-of-type(2) { left: 28%; width: 5px; height: 5px; --x: 4px; animation-delay: calc(var(--pc-t) * 3); }
-.pc-bubble:nth-of-type(3) { left: 52%; width: 10px; height: 10px; --x: -3px; animation-delay: calc(var(--pc-t) * 7); }
-.pc-bubble:nth-of-type(4) { left: 72%; width: 6px; height: 6px; --x: 6px; animation-delay: calc(var(--pc-t) * 10); }
-.pc-bubble:nth-of-type(5) { left: 90%; --x: -4px; animation-delay: calc(var(--pc-t) * 13); }
+.pc-soap-skip:hover { transform: rotate(90deg); color: var(--pc-fg); background: color-mix(in srgb, var(--pc-bad) 30%, transparent); }
 
 /* ─── Сводка «вырезано»: раскрывашка над текстом (или после думалки) ─── */
 .pc-log {
@@ -357,14 +337,6 @@
     all: unset; box-sizing: border-box; position: relative; width: 100%; cursor: pointer; font: inherit; overflow: hidden;
     display: flex; align-items: center; gap: 8px; padding: 6px 10px 4px 12px;
 }
-/* один блик при первом появлении */
-.pc-log-head::after {
-    content: ''; position: absolute; inset: 0; pointer-events: none;
-    background: linear-gradient(100deg, transparent 30%, color-mix(in srgb, var(--pc-c) 22%, transparent) 50%, transparent 70%);
-    transform: translateX(-100%);
-    animation: pc-shine calc(var(--pc-t) * 9) calc(var(--pc-t) * 3) ease-out both;
-}
-.pc-log.pc-still .pc-log-head::after { animation: none; opacity: 0; }
 .pc-log-ico {
     flex: none; display: grid; place-items: center; width: 1.7em; height: 1.7em; border-radius: 50%;
     color: var(--pc-c); background: color-mix(in srgb, var(--pc-c) 16%, transparent);
@@ -389,7 +361,6 @@
     flex: none; display: grid; place-items: center; width: 1.7em; height: 1.7em; border-radius: 50%; margin-top: 0.05em;
     color: var(--pc-c); border: 1px dashed color-mix(in srgb, var(--pc-c) 55%, transparent);
 }
-.pc-log:hover .pc-ken > i { animation: pc-scrub calc(var(--pc-t) * 6) ease-in-out 1; }
 .pc-log-say { flex: 1; min-width: 0; padding-top: 0.15em; }
 .pc-log:not(.pc-open) .pc-log-say {
     display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden;
@@ -397,16 +368,13 @@
 .pc-log:not(.pc-open) .pc-log-by { display: none; }
 .pc-log-say.pc-pop { animation: pc-pop calc(var(--pc-t) * 3) ease-out; }
 .pc-log-text { font-style: italic; color: var(--pc-fg); }
-.pc-typed { position: relative; }
-.pc-typing .pc-typed::after { content: '▍'; position: absolute; font-style: normal; color: var(--pc-c); animation: pc-blink calc(var(--pc-t) * 5) steps(1) infinite; }
-.pc-ghost { color: transparent; }
 .pc-log-text.pc-wait { color: var(--pc-em); }
 .pc-log-by { display: block; margin-top: 2px; font-size: 0.85em; color: var(--pc-em); }
 .pc-log[data-state="wait"] .pc-log-say { min-height: 1.4em; }
 .pc-dots { display: inline-flex; gap: 3px; margin-right: 7px; vertical-align: middle; }
-.pc-dots i { width: 5px; height: 5px; border-radius: 50%; background: var(--pc-c); animation: pc-dot calc(var(--pc-t) * 9) ease-in-out infinite; }
-.pc-dots i:nth-child(2) { animation-delay: calc(var(--pc-t) * 1.2); }
-.pc-dots i:nth-child(3) { animation-delay: calc(var(--pc-t) * 2.4); }
+.pc-dots i { width: 5px; height: 5px; border-radius: 50%; background: var(--pc-c); }
+.pc-dots i:nth-child(2) { opacity: 0.65; }
+.pc-dots i:nth-child(3) { opacity: 0.35; }
 
 /* тело раскрывашки: включается одним display, дальше двигается только transform/opacity */
 .pc-log-body { display: none; padding: 0 10px 8px 12px; transform-origin: top; }
@@ -414,16 +382,13 @@
 .pc-opening .pc-log-body { animation: pc-unfold calc(var(--pc-t) * 3) var(--pc-spring) both; }
 .pc-closing .pc-log-body { animation: pc-fold calc(var(--pc-t) * 1.6) ease-in both; }
 
-/* ножницы пробегают по пунктиру — линия разреза */
-.pc-snip { position: relative; height: 12px; margin: 0 0 4px; container-type: inline-size; }
+/* линия разреза */
+.pc-snip { position: relative; height: 12px; margin: 0 0 4px; }
 .pc-snip::before {
-    content: ''; position: absolute; left: 0; right: 0; top: 50%;
+    content: ''; position: absolute; left: 1.4em; right: 0; top: 50%;
     border-top: 1px dashed color-mix(in srgb, var(--pc-c) 55%, transparent);
-    transform-origin: left;
 }
-.pc-snip > i { position: absolute; left: 0; top: 50%; font-size: 0.8em; color: var(--pc-c); transform: translate(calc(100cqw - 1em), -50%) rotate(0deg); }
-.pc-opening .pc-snip::before { animation: pc-draw calc(var(--pc-t) * 5) ease-out both; }
-.pc-opening .pc-snip > i { animation: pc-run calc(var(--pc-t) * 5) cubic-bezier(0.5, 0, 0.3, 1) both; }
+.pc-snip > i { position: absolute; left: 0; top: 50%; font-size: 0.8em; color: var(--pc-c); transform: translateY(-50%) rotate(-90deg); }
 
 .pc-log-list { list-style: none; margin: 0; padding: 0 0 0 18px; display: flex; flex-direction: column; gap: 4px; }
 .pc-log-list li { position: relative; color: var(--pc-em); }
@@ -444,7 +409,6 @@
     animation-delay: calc(var(--i, 0) * var(--pc-t) * 0.6 + var(--pc-t) * 3.5);
 }
 .pc-left { padding: 0 3px; border-radius: 3px; font-weight: 600; color: var(--pc-fg); background: color-mix(in srgb, var(--pc-bad) 25%, transparent); }
-.pc-open .pc-left { animation: pc-throb calc(var(--pc-t) * 10) ease-in-out infinite; }
 .pc-times { margin-left: 5px; font-size: 0.9em; color: var(--pc-bad); }
 .pc-tag { margin-left: 6px; padding: 0 5px; border-radius: 999px; font-size: 0.82em; color: var(--pc-bad); border: 1px solid color-mix(in srgb, var(--pc-bad) 50%, transparent); }
 
@@ -467,34 +431,18 @@
 @keyframes pc-card-in { from { opacity: 0; transform: scale(0.92) translateY(8px); } }
 @keyframes pc-card-out { to { opacity: 0; transform: scale(0.95); } }
 @keyframes pc-up { from { opacity: 0; transform: translateY(8px); } }
-@keyframes pc-tape { to { transform: translateX(28.28px); } }
-@keyframes pc-wiggle { 0%, 100% { transform: rotate(-8deg); } 50% { transform: rotate(8deg) scale(1.1); } }
 @keyframes pc-stamp { from { opacity: 0; transform: scale(2.4) rotate(-10deg); } 60% { opacity: 0.85; } to { opacity: 0.6; transform: rotate(12deg); } }
 @keyframes pc-flip { from { opacity: 0.2; transform: perspective(400px) rotateX(75deg); } }
 @keyframes pc-bump { 40% { transform: scale(1.25); } }
 @keyframes pc-poke { 50% { transform: translateX(4px); } }
 @keyframes pc-rewind { to { transform: rotate(-360deg); } }
 @keyframes pc-soap-in { from { opacity: 0; transform: translate(-50%, -50%) scale(0.5) rotate(-8deg); } }
-@keyframes pc-scrub { 0%, 100% { transform: rotate(-12deg) translateX(-2px); } 50% { transform: rotate(12deg) translateX(2px); } }
-@keyframes pc-bubble { 0% { opacity: 0; transform: translateY(0) scale(0.4); } 20% { opacity: 0.9; } 100% { opacity: 0; transform: translate(var(--x, 4px), -34px) scale(1); } }
 @keyframes pc-drop { from { opacity: 0; transform: translateY(-6px) scaleY(0.85); } }
-@keyframes pc-shine { to { transform: translateX(100%); } }
 @keyframes pc-unfold { from { opacity: 0; transform: translateY(-8px) scaleY(0.92); } }
 @keyframes pc-fold { to { opacity: 0; transform: translateY(-6px) scaleY(0.94); } }
-@keyframes pc-draw { from { transform: scaleX(0); } }
-@keyframes pc-run {
-    0% { transform: translate(0, -50%) rotate(0deg); }
-    25% { transform: translate(calc(25cqw - 0.25em), -50%) rotate(-25deg); }
-    50% { transform: translate(calc(50cqw - 0.5em), -50%) rotate(0deg); }
-    75% { transform: translate(calc(75cqw - 0.75em), -50%) rotate(-25deg); }
-    100% { transform: translate(calc(100cqw - 1em), -50%) rotate(0deg); }
-}
 @keyframes pc-slide { from { opacity: 0; transform: translateX(-6px); } }
 @keyframes pc-strike { to { transform: scaleX(1); } }
-@keyframes pc-throb { 50% { opacity: 0.65; } }
 @keyframes pc-pop { from { opacity: 0; transform: translateY(3px); } }
-@keyframes pc-blink { 50% { opacity: 0; } }
-@keyframes pc-dot { 0%, 80%, 100% { opacity: 0.35; transform: translateY(0); } 40% { opacity: 1; transform: translateY(-4px); } }
 
 @media (prefers-reduced-motion: reduce) {
     #pc-popup, #pc-popup *, #pc-popup *::before, #pc-popup *::after,
@@ -503,6 +451,4 @@
         animation: none !important; transition: none !important;
     }
     .pc-cut::after { transform: none; }
-    .pc-log-head::after { display: none; }
-    .pc-bubble { display: none; }
 }
