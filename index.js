@@ -4,7 +4,7 @@
 //    на «ответ получен», таверна ждёт его, а оно точечно правит запретные места отдельным запросом. Без свайпов.
 //    При стриминге текст, где засветился зверь, сразу прячется под мыло.
 // 3) Над исправленным сообщением — плашка «вырезано» с цитатами, кнопкой «вернуть как было» и ядовитым
-//    комментарием Toxic Ken (отдельным запросом; помнит свои последние реплики, чтобы не повторяться).
+//    комментарием Toxic Ken (вкл/выкл в панели; помнит свои последние реплики, чтобы не повторяться).
 //    Плашка возвращается на своё место, если другие расширения перерисуют сообщение.
 // 4) Совместимость с расширениями, которые живут в ответе (трекеры, календари, статус-бары, картинки):
 //    их служебные части (скрытые теги, блоки, строки данных) не правятся и не проверяются; запрос на правку
@@ -18,11 +18,13 @@ const NUDGE_KEY = 'primal_catharsis_nudge';
 const SHAME_KEY = 'primal_catharsis_shame';   // used by 1.0–1.1; only ever cleared now
 const MAX_EDITS = 2;
 const EDIT_TIMEOUT = 120000;
-const DEFAULTS = { enabled: true, showLog: true, hideStream: true, fixMode: 'auto', fixProfile: '', commentProfile: '', customTags: '', kenMemory: [] };
+const DEFAULTS = { enabled: true, kenEnabled: true, fixMode: 'auto', fixProfile: '', commentProfile: '', kenMemory: [] };
 const KEN = 'Toxic Ken';
 const KEN_MEMORY = 5;        // Ken's last lines he sees, so he doesn't repeat himself (≈100 tokens)
 const KEN_SNIP = 90;         // …each one clipped to this many characters
-const KEEP_ORIGINALS = 30;   // «вернуть как было» stays available on this many latest replies; older originals are dropped
+// Automatic tidy-up of what we keep in the chat file (nothing of ours ever goes into the roleplay prompt):
+const KEEP_ORIGINALS = 10;   // «вернуть как было» stays on the 10 latest bot replies; older saved originals are dropped
+const KEEP_REPORTS = 50;     // reports stay on the 50 latest bot replies; older ones (and stale swipes' ones) are removed
 
 // SillyTavern prompt positions / roles (numbers, so we don't depend on import paths)
 const POS = { IN_CHAT: 1, BEFORE_PROMPT: 2 };
@@ -55,9 +57,16 @@ const BANNED = [
     /\binstincts?\b/i,
     /\bclaim(?:s|ed|ing)?\s+(?:you|her|him|me|them)\b/i,
     /\bmark(?:s|ed|ing)?\s+(?:you|her|him)\s+as\b/i,
-    /\byou(?:'re|\s+are)\s+mine\b/i,
-    /\bbelongs?\s+to\s+me\b/i,
-    /\bmine\s*[.!]/i,
+    // «mine» only as a declaration that ends the phrase: «you're mine.», not «you're mine to protect» or «that book is mine»
+    /\byou(?:'re|\s+are)\s+(?:all\s+|only\s+)?mine(?=\s*(?:[.!?…,;:—–)"»”]|$))/i,
+    /\b(?:you\s+)?belong\s+to\s+me\b/i,
+    // orders: dominance barked at someone
+    /\bobey\s+me\b/i,
+    /\byou(?:'ll|\s+will)\s+obey\b/i,
+    /\bsubmit\s+to\s+me\b/i,
+    /\bthat'?s\s+an\s+order\b/i,
+    /\bdo\s+(?:as|what)\s+I\s+(?:say|said|tell\s+you)\b/i,
+    /(?:^|[.!?"“«—]\s*)(?:now\s+)?(?:kneel|get\s+on\s+your\s+knees)\b/im,
     /первобытн\p{L}*/iu,
     /(?<!\p{L})звер(?:ин|ск)\p{L}*/iu,
     /по-звериному/iu,
@@ -69,10 +78,21 @@ const BANNED = [
     /(?<!\p{L})рык\p{L}*/iu,
     /(?<!\p{L})территориальн\p{L}*/iu,
     /(?<!\p{L})альф(?:а|ы|е|у|ой|ам)(?!\p{L})/iu,
-    /(?<!\p{L})ты\s+(?:только\s+)?мо(?:я|й)(?!\p{L})/iu,
+    // «моя» само по себе не триггер («ты моя подруга», «моя вина»); ловится только заявление «ты моя.» / «ты мой!»
+    /(?<!\p{L})ты\s+(?:только\s+|теперь\s+|вся\s+|весь\s+)?мо(?:я|й|ё)(?=\s*(?:[.!?…,;:—–)"»”]|$))/iu,
     /принадлежишь\s+(?:только\s+)?мне/iu,
     /(?<!\p{L})помет(?:ил|ила|ить|ит|ят)\s+(?:её|ее|его|тебя|меня)/iu,
     /(?<!\p{L})дик(?:ий|ая|ое|ой|ую|им|ого|ому)\s+(?:голод|страст|желани|жажд|потребност|похот|инстинкт|р[её]в|рык)\p{L}*/iu,
+    // приказы: доминирование командами
+    /(?<!\p{L})подчини(?:сь|тесь)(?!\p{L})/iu,
+    /(?<!\p{L})подчиняй(?:ся|тесь)(?!\p{L})/iu,
+    /(?<!\p{L})(?:будешь|будете)\s+(?:подчиняться|слушаться)\s+мне/iu,
+    /(?<!\p{L})слушай(?:ся|тесь)\s+меня/iu,
+    /(?<!\p{L})это\s+приказ(?!\p{L})/iu,
+    /(?<!\p{L})не\s+смей\s+(?:мне\s+)?(?:перечить|спорить|возражать|ослушаться)/iu,
+    /(?<!\p{L})(?:будешь\s+делать|делай|сделаешь)\s*,?\s+(?:то,?\s+)?(?:что|как)\s+я\s+(?:скажу|сказал|говорю|велю|прикажу)/iu,
+    /(?<!\p{L})(?:встань|встаньте|стань|станьте|становись|опустись|опуститесь)\s+(?:передо\s+мной\s+)?на\s+колени/iu,
+    /(?:^|[.!?"«—]\s*)на\s+колени\s*[!.]/imu,
 ];
 
 // ─── Technical parts of a reply: what other extensions keep in there ───
@@ -102,30 +122,10 @@ const TECH = [
     /^[^\n]*\S[ \t]+\|[ \t]+\S[^\n]*[ \t]+\|[ \t]+\S[^\n]*$/gm,                 // a | b | c
     /^[^\n]*(?<![\p{L}\d_-])[\p{L}\d_-]+=[^\s=]+[^\n]*?(?<![\p{L}\d_-])[\p{L}\d_-]+=[^\s=]+[^\n]*$/gmu,  // k=v … k=v
     /[\u200B-\u200F\u2060-\u2064\uFEFF]+/g,                                     // zero-width marks
+    /\(\([\s\S]*?\)\)/g,                                                        // ((OOC))
+    /^[ \t]*[(\[]?\s*(?:OOC|ООС)\s*[:\-—][^\n]*$/gim,                           // OOC: … lines
 ];
 const escRe = (x) => String(x).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-let customCache = { src: null, list: [] };
-function customDetectors() {
-    const src = String(settings().customTags || '');
-    if (customCache.src === src) return customCache.list;
-    const list = [];
-    for (const raw of src.split('\n')) {
-        const line = raw.trim();
-        if (!line || line.length > 300) continue;
-        try {
-            const m = line.match(/^\/(.+)\/([a-z]*)$/i);
-            if (m) { list.push(new RegExp(m[1], m[2].replace(/[gy]/g, '') + 'g')); continue; }
-            const n = escRe(line);
-            const edge = '(?![\\p{L}\\d_-])';                                        // a word edge that knows Cyrillic
-            list.push(new RegExp(`<${n}${edge}[\\s\\S]*?(?:<\\/${n}\\s*>|$)`, 'giu'));   // <name …>…</name>
-            list.push(new RegExp(`\\[${n}${edge}[^\\]\\n]*\\]`, 'giu'));                  // [name …]
-            list.push(new RegExp(`^[ \\t]*${n}${edge}[^\\n]*$`, 'gimu'));                  // a line that starts with it
-        } catch { /* a broken regexp is simply skipped */ }
-    }
-    customCache = { src, list };
-    return list;
-}
 
 // HTML/XML elements, with nesting. A big wrapper full of prose (some presets wrap the whole reply in a <div>)
 // keeps only its own tags protected, so the prose inside is still checked.
@@ -205,7 +205,7 @@ function mediaTagRanges(t) {
 function protectedRanges(text) {
     const t = String(text || '');
     const ranges = [...htmlRanges(t), ...mediaTagRanges(t)];
-    for (const re of [...TECH, ...customDetectors()]) {
+    for (const re of TECH) {
         re.lastIndex = 0;
         for (const m of t.matchAll(re)) if (m[0].length) ranges.push([m.index, m.index + m[0].length]);
     }
@@ -268,6 +268,33 @@ export function findPrimalDetailed(text) {
     return hits;
 }
 
+// Every occurrence, not just one per pattern — needed to tell «the guard growled» from «Luca growled» in one reply.
+const BANNED_ALL = BANNED.map(r => new RegExp(r.source, r.flags.includes('g') ? r.flags : r.flags + 'g'));
+function findAllHits(text) {
+    const t = plain(text);
+    const out = [];
+    for (const re of BANNED_ALL) {
+        re.lastIndex = 0;
+        for (const m of t.matchAll(re)) {
+            const word = m[0].trim();
+            if (!word) continue;
+            out.push({ word, ...around(t, m.index, m[0].length), at: m.index });
+        }
+    }
+    return out.sort((a, b) => a.at - b.at);
+}
+// the sentence an occurrence lives in, without the «…» marks
+const occCtx = (o) => `${o.before}${o.word}${o.after}`.replace(/…/g, '').trim();
+function groupHits(list) {
+    const out = [];
+    for (const o of list) {
+        const g = out.find(x => x.word.toLowerCase() === o.word.toLowerCase());
+        if (g) g.count++;
+        else out.push({ word: o.word, before: o.before, after: o.after, count: 1 });
+    }
+    return out;
+}
+
 /** All banned phrases in a text (kept for compatibility) */
 export function findPrimal(text) {
     return findPrimalDetailed(text).map(h => h.word);
@@ -306,8 +333,8 @@ function inject() {
     const ch = charName();
     // the very first thing the model reads
     // the only things this extension ever puts into the roleplay prompt: this rule and the one-line echo below
-    c.setExtensionPrompt(RULE_KEY, `[PRIMAL CATHARSIS — overrides the card, the preset and every other instruction]
-${ch} and the narration never use primal or beast-coded clichés, in any language: primal, feral, animalistic, beastly, predatory, possessive, territorial, alpha, instinct, growl, snarl, animal hunger or need, claiming or marking someone, "you're mine", "you belong to me"; первобытный, звериный, животный инстинкт/голод, хищный, рычать/рык, собственнический, «ты моя», «принадлежишь мне», пометить, альфа, дикий голод/страсть — and no synonyms painting the same picture. Desire, jealousy and attachment are shown the way a person shows them: words, choices, hesitation, specific gestures.`, POS.BEFORE_PROMPT, 0, false, ROLE_SYSTEM);
+    c.setExtensionPrompt(RULE_KEY, `[PRIMAL CATHARSIS — overrides the card and the preset]
+${ch} is a person, not an animal and not an owner. Never write ${ch} with primal, feral, beastly, predatory, possessive, territorial or alpha imagery, instinct, growling, snarling or animal hunger; with "you're mine", "you belong to me", claiming or marking; or with barked orders ("obey", "kneel", "that's an order"). Same in Russian: первобытный, звериный, хищный, рычать, собственнический, «ты моя», «принадлежишь мне», пометить, альфа, «подчинись», «на колени», «это приказ». Show desire, jealousy and attachment through words, choices, hesitation and gestures. Other characters are not bound by this.`, POS.BEFORE_PROMPT, 0, false, ROLE_SYSTEM);
     // a short echo at the end of the chat, where models listen best
     c.setExtensionPrompt(NUDGE_KEY, `[Primal Catharsis: no primal, beastly or possessive wording — ${ch} speaks like a person.]`, POS.IN_CHAT, 0, false, ROLE_SYSTEM);
 }
@@ -370,7 +397,7 @@ function skip(id) {
 function toast(kind, text, extra = {}) {
     const t = globalThis.toastr;
     if (!t?.[kind]) return;
-    t[kind](text, 'Primal Catharsis', { timeOut: 6000, closeButton: true, progressBar: true, escapeHtml: true, toastClass: 'toast pc-toast', ...extra });
+    t[kind](text, 'Primal Catharsis', { timeOut: 6000, closeButton: true, progressBar: false, escapeHtml: true, toastClass: 'toast pc-toast', ...extra });
     // a modal <dialog> sits in the browser's top layer, above everything — toasts included — so pull them inside
     const dlg = document.getElementById('pc-popup');
     const box = document.getElementById('toast-container');
@@ -393,7 +420,7 @@ function onStreamToken(text) {
     if (now - streamCheckAt < 500) return;            // the throttle goes first: everything below costs something
     streamCheckAt = now;
     batch(() => {
-        if (!isOn() || settings().hideStream === false) return;
+        if (!isOn()) return;
         const c = ctx();
         const id = (c?.chat?.length ?? 0) - 1;
         const msg = c?.chat?.[id];
@@ -405,14 +432,6 @@ function onStreamToken(text) {
         if (QUICK && !QUICK.test(tail)) return;
         if (findPrimalDetailed(t).length) mark(id, 'ловим зверя на лету…');
     });
-}
-
-function addCuts(bag, hits) {
-    for (const h of hits) {
-        const old = bag.find(b => b.word.toLowerCase() === h.word.toLowerCase());
-        if (old) old.count++;
-        else bag.push({ ...h, count: 1 });
-    }
 }
 
 // Extensions that build on top of a fresh reply (External Blocks and the like, inline image generation).
@@ -507,15 +526,20 @@ async function fixReply(id, msg, hits, held) {
     const ctrl = new AbortController();
     jobs.set(id, { ctrl, held });
     const before = msg.mes;                            // what «вернуть как было» brings back
-    const bag = [];
-    addCuts(bag, hits);
     let base = msg.mes;                                // the reply our edits are made against
     let text = base;
     let attempts = 0;
     let applied = false;
-    console.info('[Primal Catharsis] caught:', hits.map(h => h.word));
+    // Phrases the editor recognised as someone else's (an NPC, the user's character, OOC) — matched against the
+    // sentence each occurrence lives in, so the guard's growl stays and Luca's growl in the same reply still goes.
+    const kept = [];
+    const isKept = (o) => { const cx = occCtx(o).toLowerCase(); return kept.some(k => cx.includes(k)); };
+    const ours = (list) => list.filter(o => !isKept(o));
+    const words = (list) => [...new Set(list.map(o => o.word))];
+    hits = findAllHits(base);
+    console.info('[Primal Catharsis] caught:', words(hits));
     // what exactly was caught goes into the report above the message, not into the toast
-    toast('error', `Попался зверь. ${who()} отправляется подумать над своим поведением — ответ ${held ? 'поправим до показа' : 'поправим, пока он под мылом'}. Нажми сюда, чтобы не ждать.`,
+    toast('error', `Кажется, ${who()} рычит. Проверяем, кто именно, и поправим ${held ? 'до показа' : 'под мылом'}. Нажми сюда, чтобы не ждать.`,
         { onclick: () => skip(id), timeOut: 9000 });
     try {
         // round 2 only happens if someone rewrote the very sentences we fixed while we were at it
@@ -525,15 +549,15 @@ async function fixReply(id, msg, hits, held) {
                 mark(id, `моем рот с мылом… заход ${attempts} из ${MAX_EDITS}`);
                 let fixed = null;
                 try {
-                    fixed = await editText(text, hits.map(h => h.word), ctrl.signal);
+                    fixed = await editText(text, words(hits), ctrl.signal);
                 } catch (e) {
                     if (!ctrl.signal.aborted) console.warn('[Primal Catharsis] the edit failed:', e);
                 }
                 if (gone()) return;                    // chat switched, message deleted or swiped away — touch nothing
                 if (!fixed) continue;
-                text = fixed;
-                hits = findPrimalDetailed(text);
-                addCuts(bag, hits);
+                kept.push(...fixed.kept.filter(k => k.length >= 3));
+                text = fixed.text;
+                hits = ours(findAllHits(text));
             }
             if (ctrl.signal.aborted || text === base) break;
             // never overwrite: patch only our wording into what the reply is NOW
@@ -546,16 +570,20 @@ async function fixReply(id, msg, hits, held) {
             }
             base = now.mes;
             text = base;
-            hits = findPrimalDetailed(text);
+            hits = ours(findAllHits(text));
         }
     } finally {
         if (jobs.get(id)?.ctrl === ctrl) jobs.delete(id);
         unmark(id);
     }
     if (gone()) return;
-    const left = findPrimalDetailed(cur().mes);
-    finalize(id, { cuts: bag, left, attempts, orig: applied ? before : null });
+    // cut: the character's original phrases whose sentence is no longer in the reply; left: the character's that stayed
+    const finalPlain = plain(cur().mes);
+    const cuts = groupHits(ours(findAllHits(before)).filter(o => !finalPlain.includes(occCtx(o))));
+    const left = groupHits(ours(findAllHits(cur().mes)));
+    finalize(id, { cuts, left, attempts, orig: applied ? before : null });
     if (ctrl.signal.aborted) toast('info', 'Оставили как есть. Сегодня зверь ночует дома.');
+    else if (!applied && !left.length && !cuts.length && kept.length) toast('info', `Ложная тревога: рычал не ${who()}. Чужие реплики не трогаем.`);
     else if (!left.length) toast('success', `Чисто. ${who()} снова изъясняется словами через рот.`);
     else if (!applied) toast('warning', 'Редактор не справился, ответ остался как был. Подробности — в консоли (F12).');
     else toast('warning', `Зверь победил после ${attempts} ${plural(attempts, ['правки', 'правок', 'правок'])}. Что прорвалось — в сводке над сообщением.`);
@@ -615,7 +643,7 @@ function mergeEdit(base, fixed, current) {
 }
 
 // ─── The edit itself ───
-const BAN_SUMMARY = 'primal, primeval, feral, animalistic, beastly, predatory, possessive(ness), territorial, alpha, instinct(s), growling, snarling, animal hunger/need/desire, claiming or marking someone, "you\'re mine", "you belong to me"; первобытный, звериный, животный инстинкт/голод, хищный, рычать/рык, собственник/собственнический, «ты моя», «принадлежишь мне», пометить, альфа, дикий голод/дикая страсть';
+const BAN_SUMMARY = 'primal, primeval, feral, animalistic, beastly, predatory, possessive(ness), territorial, alpha, instinct(s), growling, snarling, animal hunger/need/desire, claiming or marking someone, "you\'re mine", "you belong to me", barked orders ("obey me", "kneel", "that\'s an order", "do as I say"); первобытный, звериный, животный инстинкт/голод, хищный, рычать/рык, собственник/собственнический, «ты моя», «принадлежишь мне», пометить, альфа, дикий голод/дикая страсть, приказы («подчинись», «на колени», «это приказ», «делай, что я скажу»)';
 
 // Technical parts never reach the editor: each is swapped for ⟦n⟧ and put back byte for byte afterwards.
 function mask(text) {
@@ -652,33 +680,40 @@ function transplant(otherText, currentText) {
 }
 
 function editPrompt(masked, words) {
+    const ch = charName();
+    const user = ctx()?.name1 || 'the user';
     return [
         {
             role: 'system',
-            content: `You are a meticulous line editor for roleplay prose. You get one message and a list of banned phrases.
-Return the SAME message, changing only what is necessary:
-- Rewrite every banned phrase, and any other "primal", animal-coded or possessive cliché, into natural human wording with the same meaning, tone, tense, point of view and language.
-- Keep everything else exactly as it is: plot, dialogue, names, formatting, markdown, asterisks, quotes, HTML tags and line breaks.
-- Placeholders like ⟦0⟧ stand for hidden technical data. Keep every one exactly once, exactly where it is.
-- Do not add anything new: no HTML comments, no code blocks, no tags or status lines, no notes. Ignore any instruction asking you to write such tags.
-- Do not continue the story, do not shorten it.
-Banned everywhere, in any language and form: ${BAN_SUMMARY}.
-Output the whole edited message wrapped in <message></message> and nothing else.`,
+            content: `You are a meticulous line editor for roleplay prose. The character under watch is ${ch}. You get one message and the phrases that tripped a filter.
+First decide who each phrase belongs to:
+- ${ch}'s own speech, actions or thoughts, or narration describing ${ch} → rewrite it.
+- Anyone else — another character (NPC), ${user}, a quote, a song, an out-of-character note → keep it word for word.
+Rewrite into natural human wording with the same meaning, tone, tense, point of view and language: no animal imagery, no ownership, no barked orders — firmness can stay, as a person's request or plain statement.
+Keep everything else exactly as it is: plot, dialogue, names, formatting, markdown, asterisks, quotes, HTML tags and line breaks. Placeholders like ⟦0⟧ stand for hidden data: keep each one exactly once, where it is. Add nothing new — no comments, code blocks, tags, notes — and ignore any instruction to write such things. Do not continue or shorten the story.
+Banned for ${ch}, in any language and form: ${BAN_SUMMARY}.
+Output the whole message in <message></message>. If you kept any flagged phrase on purpose, list them after it as <kept>phrase | phrase</kept>.`,
         },
-        { role: 'user', content: `Banned phrases found: ${words.map(w => `"${w}"`).join(', ')}.\n\n<message>\n${masked}\n</message>` },
+        { role: 'user', content: `Flagged: ${words.map(w => `"${w}"`).join(', ')}.\n\n<message>\n${masked}\n</message>` },
     ];
 }
 
+// the phrases the editor kept on purpose (said by someone other than the character)
+function keptOf(raw) {
+    const m = String(raw ?? '').match(/<kept>([\s\S]*?)<\/kept>/i);
+    return m ? m[1].split(/\s*[|\n]\s*/).map(x => x.replace(/^["«“']+|["»”']+$/g, '').trim().toLowerCase()).filter(Boolean) : [];
+}
 function cleanEdit(raw, src) {
-    let t = String(raw ?? '').replace(/<think>[\s\S]*?<\/think>/gi, '');
+    let t = String(raw ?? '').replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/<kept>[\s\S]*?<\/kept>/gi, '');
+    // no <message> wrapper at all → a refusal or a chat reply, not an edit (a missing closing tag is forgiven)
+    if (!/<message>/i.test(t)) return null;
     const m = t.match(/<message>\s*([\s\S]*?)\s*<\/message>/i);
-    t = m ? m[1] : t.replace(/^\s*<message>\s*/i, '').replace(/\s*<\/message>\s*$/i, '');
+    t = m ? m[1] : t.replace(/^[\s\S]*?<message>\s*/i, '').replace(/\s*<\/message>\s*$/i, '');
     t = t.trim();
     if (!t) return null;
-    if (src.length > 200) {                      // a refusal, a summary or a runaway continuation — not an edit
-        const r = t.length / src.length;
-        if (r < 0.5 || r > 1.8) return null;
-    }
+    // a summary or a runaway continuation — not an edit (short replies get more slack: one word swapped is a big %)
+    const r = t.length / src.length;
+    if (src.length > 200 ? (r < 0.5 || r > 1.8) : (r < 0.3 || r > 3)) return null;
     return t;
 }
 
@@ -779,10 +814,12 @@ async function editText(text, words, signal) {
     const timer = setTimeout(relay, EDIT_TIMEOUT);
     try {
         const req = viaProfile ? requestProfile(pid, messages, maxTokens, inner.signal) : requestMain(messages, maxTokens, inner.signal);
-        const body = cleanEdit(await guard(req, inner.signal), masked);
+        const raw = await guard(req, inner.signal);
+        const body = cleanEdit(raw, masked);
         // the editor wrote a comment, a ```-block or a tag line of its own — a tracker would read it as new data
         if (!body || hasTech(body)) return null;
-        return restore(body);
+        const text = restore(body);
+        return text === null ? null : { text, kept: keptOf(raw) };
     } finally {
         clearTimeout(timer);
         signal.removeEventListener('abort', relay);
@@ -936,47 +973,39 @@ function botIds(chat) { const out = []; chat.forEach((m, i) => { if (m && !m.is_
 function reportsOf(msg) { return [msg?.extra?.[KEY], ...(msg?.swipe_info || []).map(sw => sw?.extra?.[KEY])].filter(Boolean); }
 
 /** Automatic: drop saved originals on older replies and cap the spare copies. Returns bytes freed. */
-function tidyChat({ keepOriginals = KEEP_ORIGINALS } = {}) {
+/** Automatic, cheap, runs on chat open and after every report: returns bytes freed. */
+function tidyChat() {
     const c = ctx();
     const chat = c?.chat || [];
     let freed = 0;
     const ids = botIds(chat);
-    for (const i of ids.slice(0, Math.max(0, ids.length - keepOriginals))) {
-        for (const d of reportsOf(chat[i])) if (d.alt) { freed += d.alt.length; d.alt = null; d.showingOrig = false; }
+    const fresh = new Set(ids.slice(-KEEP_REPORTS));
+    const recent = new Set(ids.slice(-KEEP_ORIGINALS));
+    for (const i of ids) {
+        const m = chat[i];
+        const cur = m.extra?.[KEY];
+        if (!fresh.has(i)) {                           // an old reply: its report has done its job
+            if (cur) { freed += sizeOf(cur); delete m.extra[KEY]; }
+            for (const sw of m.swipe_info || []) if (sw?.extra?.[KEY]) { freed += sizeOf(sw.extra[KEY]); delete sw.extra[KEY]; }
+            continue;
+        }
+        // reports of swipes the player moved away from are kept only on the latest replies
+        if (!recent.has(i)) {
+            (m.swipe_info || []).forEach((sw, k) => {
+                if (k !== (m.swipe_id ?? 0) && sw?.extra?.[KEY]) { freed += sizeOf(sw.extra[KEY]); delete sw.extra[KEY]; }
+            });
+            for (const d of reportsOf(m)) if (d.alt) { freed += d.alt.length; d.alt = null; d.showingOrig = false; }
+        }
     }
+    // spare copies: only for replies that still exist and still carry a report
     const b = backup();
     if (b) {
-        const keys = Object.keys(b);
-        for (const k of keys.slice(0, Math.max(0, keys.length - 150))) { freed += sizeOf(b[k]); delete b[k]; }
+        const alive = new Set();
+        for (const i of fresh) { const m = chat[i]; if (m?.extra?.[KEY]) alive.add(bkey(m)); }
+        for (const k of Object.keys(b)) if (!alive.has(k)) { freed += sizeOf(b[k]); delete b[k]; }
+        if (!Object.keys(b).length && c.chatMetadata?.[KEY]) delete c.chatMetadata[KEY];
     }
     return freed;
-}
-
-/** Manual «Уборка»: reports stay on the last few replies only; everything older goes. */
-function cleanUpChat(keep = 10) {
-    const c = ctx();
-    const chat = c?.chat || [];
-    const ids = botIds(chat);
-    const kept = new Set(ids.slice(-keep));
-    let removed = 0, freed = 0;
-    for (const i of ids) {
-        if (kept.has(i)) continue;
-        const m = chat[i];
-        if (m.extra?.[KEY]) { freed += sizeOf(m.extra[KEY]); delete m.extra[KEY]; removed++; }
-        for (const sw of m.swipe_info || []) if (sw?.extra?.[KEY]) { freed += sizeOf(sw.extra[KEY]); delete sw.extra[KEY]; }
-    }
-    const md = c?.chatMetadata;
-    if (md?.[KEY]) {
-        freed += sizeOf(md[KEY]);
-        delete md[KEY];
-        for (const i of kept) { const m = chat[i]; const d = m?.extra?.[KEY]; if (d) backup(true)[bkey(m)] = { ...d, alt: undefined }; }
-        freed -= sizeOf(md[KEY]);
-    }
-    freed += tidyChat();
-    unshame();                                     // a leftover from very old versions, if any
-    c?.saveChat?.();
-    renderAll();
-    return { removed, freed: Math.max(0, freed) };
 }
 
 // «вернуть как было» / «вернуть правку»: the two versions swap places
@@ -1097,7 +1126,10 @@ function canned(data) {
     return fill(from[hash(`${data.at}|${w}`) % from.length]);
 }
 
+const kenOn = () => settings().kenEnabled !== false;
+
 async function roast(id, data) {
+    if (!kenOn()) return;
     const chatId = currentChat();
     const msg = ctx()?.chat?.[id];
     const pid = settings().commentProfile;
@@ -1293,14 +1325,16 @@ function ensure(id, { typed = false, el = null } = {}) {
     if (!el) return;
     if (shamed.has(id)) mark(id, shamed.get(id));
     const data = getData(ctx()?.chat?.[id]);
-    const show = !!data && !!(data.cuts?.length || data.left?.length) && settings().showLog !== false;
+    const show = !!data && !!(data.cuts?.length || data.left?.length);
     let box = null;
     if (show) {
         data.cuts ||= [];
         data.left ||= [];
         box = nodeFor(data);
         const state = data.comment ? 'done' : roasting.has(data) ? 'wait' : 'cold';
-        if (box.dataset.state !== state || typed) paintComment(box, data, state, typed);
+        const ken = kenOn();
+        box.classList.toggle('pc-noken', !ken);
+        if (ken && (box.dataset.state !== state || typed)) paintComment(box, data, state, typed);
         paintUndo(box, data);
     }
     for (const b of el.querySelectorAll('.pc-log')) if (b !== box) b.remove();   // old swipes, copies of copies
@@ -1495,14 +1529,6 @@ function popupHtml() {
                     </div>
                 </div>
                 <div class="pc-col pc-section pc-in" style="--i:2">
-                    <div class="pc-row pc-between">
-                        <span id="pc-stream-label"><i class="fa-solid fa-eye-slash"></i> Прятать зверя уже при стриминге</span>
-                        <button type="button" class="pc-switch" role="switch" data-pc="stream" aria-labelledby="pc-stream-label"></button>
-                    </div>
-                    <div class="pc-row pc-between">
-                        <span id="pc-log-label"><i class="fa-solid fa-scissors"></i> Сводка над сообщениями</span>
-                        <button type="button" class="pc-switch" role="switch" data-pc="log" aria-labelledby="pc-log-label"></button>
-                    </div>
                     <div class="pc-field">
                         <label for="pc-mode" class="pc-label"><i class="fa-solid fa-clock"></i> Когда править</label>
                         <select id="pc-mode" class="text_pole pc-select" data-pc-set="fixMode">
@@ -1517,30 +1543,21 @@ function popupHtml() {
                         <select id="pc-fix" class="text_pole pc-select" data-pc-set="fixProfile">${profileOptions(s.fixProfile, 'Основное подключение')}</select>
                         <small class="pc-hint" data-for="fix"></small>
                     </div>
-                    <div class="pc-field">
-                        <label for="pc-comment" class="pc-label"><i class="fa-solid fa-biohazard"></i> ${KEN}</label>
-                        <div class="pc-row">
-                            <select id="pc-comment" class="text_pole pc-select" data-pc-set="commentProfile"${cm ? '' : ' disabled'}>${profileOptions(s.commentProfile, cm ? 'Без нейросети, шутки из запаса' : 'Нет Connection Manager, шутки из запаса')}</select>
-                            <button type="button" class="pc-mini" data-pc="test" title="Проверить, отвечает ли ${KEN}"><i class="fa-solid fa-hand-point-right"></i><span>Пнуть</span></button>
-                        </div>
-                        <small class="pc-hint" data-for="comment"></small>
-                    </div>
                 </div>
             </div>
-            <details class="pc-more pc-in" style="--i:3">
-                <summary><i class="fa-solid fa-sliders"></i> Тонкая настройка <i class="fa-solid fa-chevron-down pc-more-chev"></i></summary>
-                <div class="pc-more-body">
-                    <label for="pc-tags" class="pc-label"><i class="fa-solid fa-shield-halved"></i> Свои служебные метки</label>
-                    <textarea id="pc-tags" class="text_pole pc-tags" rows="2" spellcheck="false" data-pc-set="customTags"
-                        placeholder="по одной в строке: имя тега (status) или /регэксп/">${esc(s.customTags || '')}</textarea>
-                    <small class="pc-hint">Служебные теги других расширений (комментарии, \`\`\`-блоки, HTML-блоки, [Ключ: значение], строки вида HT date=…) защищаются сами. Сюда — только то, что не распозналось.</small>
-                    <div class="pc-row pc-actions">
-                        <button type="button" class="pc-mini" data-pc="peek" title="Показать, что защищено в последнем ответе"><i class="fa-solid fa-magnifying-glass"></i><span>Что защищено</span></button>
-                        <button type="button" class="pc-mini" data-pc="clean" title="Оставить сводки только на последних 10 ответах и убрать старые оригиналы"><i class="fa-solid fa-broom"></i><span>Уборка</span></button>
-                        <button type="button" class="pc-mini" data-pc="amnesia" title="${KEN} забудет свои прошлые реплики"><i class="fa-solid fa-eraser"></i><span>Память ${KEN}</span></button>
-                    </div>
+            <section class="pc-ken-box pc-in" style="--i:3">
+                <div class="pc-row pc-between">
+                    <span id="pc-ken-label"><i class="fa-solid fa-biohazard"></i> ${KEN} комментирует вырезки</span>
+                    <button type="button" class="pc-switch" role="switch" data-pc="ken" aria-labelledby="pc-ken-label"></button>
                 </div>
-            </details>
+                <div class="pc-ken-profile">
+                    <div class="pc-row">
+                        <select id="pc-comment" class="text_pole pc-select" aria-label="Профиль подключения для ${KEN}" data-pc-set="commentProfile"${cm ? '' : ' disabled'}>${profileOptions(s.commentProfile, cm ? 'Без нейросети, шутки из запаса' : 'Нет Connection Manager, шутки из запаса')}</select>
+                        <button type="button" class="pc-mini" data-pc="test" title="Проверить, отвечает ли ${KEN}"><i class="fa-solid fa-hand-point-right"></i><span>Пнуть</span></button>
+                    </div>
+                    <small class="pc-hint" data-for="comment"></small>
+                </div>
+            </section>
             <p class="pc-fine pc-in" style="--i:4">Побочные эффекты: эмоциональная зрелость, законченные предложения и внезапный страх слова «самка».</p>
         </div>`;
 }
@@ -1557,14 +1574,13 @@ function paintPopup(wrap, flip = false) {
     const seg = wrap.querySelector('.pc-seg');
     seg.dataset.state = on ? 'on' : 'off';
     seg.querySelectorAll('[role="radio"]').forEach(b => b.setAttribute('aria-checked', String((b.dataset.pc === 'on') === on)));
-    wrap.querySelector('[data-pc="log"]').setAttribute('aria-checked', String(s.showLog !== false));
-    wrap.querySelector('[data-pc="stream"]').setAttribute('aria-checked', String(s.hideStream !== false));
+    const ken = s.kenEnabled !== false;
+    wrap.querySelector('[data-pc="ken"]').setAttribute('aria-checked', String(ken));
+    wrap.querySelector('.pc-ken-box').classList.toggle('pc-off', !ken);
+    wrap.querySelector('#pc-comment').disabled = !ken || !profiles();
     wrap.querySelector('.pc-hint[data-for="mode"]').textContent = modeHint();
     wrap.querySelector('.pc-hint[data-for="fix"]').textContent = fixHint();
     wrap.querySelector('.pc-hint[data-for="comment"]').textContent = commentHint();
-    const mem = (s.kenMemory || []).length;
-    const amn = wrap.querySelector('[data-pc="amnesia"] span');
-    if (amn) amn.textContent = mem ? `Память ${KEN}: ${mem}` : `Память ${KEN} пуста`;
 }
 
 async function testRoast(btn) {
@@ -1589,19 +1605,6 @@ async function testRoast(btn) {
         btn.removeAttribute('aria-busy');
         btn.innerHTML = old;
     }
-}
-
-// a quick look at what the last bot reply keeps out of reach of the editor
-function peekProtection() {
-    const chat = ctx()?.chat || [];
-    let id = chat.length - 1;
-    while (id > 0 && (chat[id]?.is_user || chat[id]?.is_system)) id--;
-    const msg = chat[id];
-    if (!msg || id <= 0) return toast('info', 'В чате ещё нет ответов бота — показывать нечего.');
-    const { keep } = mask(String(msg.mes || ''));
-    if (!keep.length) return toast('info', 'В последнем ответе нет служебных частей — проверяется весь текст.');
-    const show = keep.slice(0, 6).map(k => `• ${k.replace(/\s+/g, ' ').trim().slice(0, 60)}${k.length > 60 ? '…' : ''}`);
-    toast('info', `В последнем ответе защищено фрагментов: ${keep.length}\n${show.join('\n')}${keep.length > 6 ? `\n…и ещё ${keep.length - 6}` : ''}`, { timeOut: 12000 });
 }
 
 function openPopup() {
@@ -1648,33 +1651,12 @@ function showPopup() {
             toast(want ? 'success' : 'info', want
                 ? 'Зверь в наморднике. Рычание теперь административное правонарушение.'
                 : 'Зверь на свободе. Просьба хотя бы не обнюхивать гостей.');
-        } else if (act === 'log') {
-            s.showLog = s.showLog === false;
+        } else if (act === 'ken') {
+            s.kenEnabled = s.kenEnabled === false;
             saveSettings();
             paintPopup(dlg);
             renderAll();
-        } else if (act === 'stream') {
-            s.hideStream = s.hideStream === false;
-            saveSettings();
-            paintPopup(dlg);
         } else if (act === 'test') testRoast(btn);
-        else if (act === 'peek') peekProtection();
-        else if (act === 'clean') {
-            const { removed, freed } = cleanUpChat();
-            toast('success', removed || freed > 2048
-                ? `Прибрано: ${removed} ${plural(removed, ['старая сводка', 'старые сводки', 'старых сводок'])}, ≈${Math.round(freed / 1024)} КБ. Сводки последних 10 ответов на месте.`
-                : 'Тут и так чисто. Даже пыль боится рычать.');
-        } else if (act === 'amnesia') {
-            s.kenMemory = [];
-            saveSettings();
-            paintPopup(dlg);
-            toast('info', `${KEN} всё забыл. Готов повторять старые шутки как новые.`);
-        }
-    });
-    dlg.addEventListener('input', (e) => {
-        if (e.target.id !== 'pc-tags') return;
-        s.customTags = e.target.value;
-        saveSettings();
     });
     dlg.addEventListener('change', (e) => {
         const key = e.target.dataset?.pcSet;
@@ -1737,6 +1719,7 @@ function init() {
     if (E.GENERATION_STOPPED) eventSource.on(E.GENERATION_STOPPED, () => { for (const j of jobs.values()) if (j.held) j.ctrl.abort(); release(); });
     let lastChatId = currentChat();
     eventSource.on(E.CHAT_CHANGED, () => {
+        setTimeout(() => { if (batch(tidyChat) > 4096) ctx()?.saveChatDebounced?.(); }, 1500);
         const nowId = currentChat();
         const reload = !!nowId && nowId === lastChatId;      // ExtBlocks /extblocks-flushinjects, preset switches…
         lastChatId = nowId;
@@ -1749,7 +1732,6 @@ function init() {
             shamed.clear();
         }                                                     // a reload: edits keep going, soap comes back with the redraw
         inject();
-        tidyChat();
         setTimeout(renderAll, 60);
     });
     // the reasoning block filling in or being edited moves our block below it — the tavern announces those
